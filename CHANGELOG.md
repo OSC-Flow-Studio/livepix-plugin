@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.0.0 (2026-09-21)
+
+- As doações chegam pelo OSC LivePix Dashboard, que recebe o webhook do LivePix e guarda
+  cada doação. O plugin não fala mais direto com a API do LivePix.
+- WebSocket como caminho principal; consulta à API do dashboard no intervalo configurado
+  enquanto o WebSocket estiver fora, com reconexão automática.
+- Novo campo **Início do subathon**: só doações a partir dele disparam. Vazio, conta a
+  partir da primeira ativação.
+- O ID de cada doação processada fica no cofre antes do gatilho disparar. Na ativação, a
+  cada reconexão e a cada cinco minutos o plugin relê tudo desde o início do subathon e
+  dispara só o que ainda não foi processado.
+- Configuração nova: URL base (padrão `https://livepix.maned.club`), token da API e
+  intervalo de consulta. Saem Client ID, Client Secret, leitura de mensagens e histórico
+  inicial.
+- A ação de consulta virou **LivePix: sincronizar agora**; **LivePix: ler status** ganhou
+  `transport` e `startAt`. Tipos dos blocos e formato do gatilho preservados.
+- Doações já disparadas pela 1.2.0 continuam marcadas como processadas.
+- Novo `dashboard/`: OSC LivePix Dashboard (Hono, Prisma, Postgres, Better Auth, React).
+
 ## 1.2.0 — 2026-09-12
 
 - Compatibilidade declarada com OSC Flow Studio 0.5.x, API de plugins 1.

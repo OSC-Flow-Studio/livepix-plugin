@@ -1,8 +1,108 @@
 import assert from "node:assert/strict";
+import http from "node:http";
 import test from "node:test";
-import plugin from "../plugin/index.mjs";
+import { WebSocketServer } from "ws";
+import plugin, { connectWebSocket, parseStartAt, webhookIdFromToken } from "../plugin/index.mjs";
 
-function context(overrides = {}, sharedSecrets = new Map()) {
+const WEBHOOK = "Wh00kIdForTests0000000AB";
+const TOKEN = `olp_${WEBHOOK}_s3cretPartOfTheToken`;
+const START = "2026-09-21T12:00:00.000Z";
+
+/**
+ * A dashboard that behaves like the real one on the wire: the donations API with
+ * `since`/`after`/`limit`, and the WebSocket that pushes new donations.
+ */
+async function fakeDashboard({ rejectSocket = 0, rejectApi = 0 } = {}) {
+  const donations = [];
+  const sockets = new Set();
+  const requests = [];
+  let seq = 0;
+  const state = { rejectSocket, rejectApi, authorization: [] };
+
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, "http://localhost");
+    requests.push(url.pathname + url.search);
+    state.authorization.push(req.headers.authorization);
+    if (req.headers.authorization !== "Bearer " + TOKEN) return reply(res, 401, { error: "unauthorized" });
+    if (state.rejectApi) return reply(res, state.rejectApi, { error: "down" });
+    if (url.pathname !== `/${WEBHOOK}/api/donations`) return reply(res, 404, { error: "not_found" });
+    const since = Date.parse(url.searchParams.get("since"));
+    const after = Number(url.searchParams.get("after") ?? 0);
+    const limit = Number(url.searchParams.get("limit") ?? 200);
+    const matching = donations.filter((d) => Date.parse(d.occurredAt) >= since && Number(d.seq) > after);
+    const page = matching.slice(0, limit);
+    reply(res, 200, {
+      donations: page,
+      nextAfter: page.length ? page[page.length - 1].seq : url.searchParams.get("after"),
+      hasMore: matching.length > limit,
+    });
+  });
+  const wss = new WebSocketServer({ noServer: true });
+  server.on("upgrade", (req, socket, head) => {
+    if (req.headers.authorization !== "Bearer " + TOKEN) {
+      socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+      return;
+    }
+    if (state.rejectSocket) {
+      socket.end(`HTTP/1.1 ${state.rejectSocket} Nope\r\nConnection: close\r\n\r\n`);
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      sockets.add(ws);
+      ws.on("close", () => sockets.delete(ws));
+      ws.send(JSON.stringify({ type: "hello", webhook: { id: WEBHOOK } }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  return {
+    baseUrl,
+    requests,
+    sockets,
+    state,
+    /** Stores a donation; `push` also sends it down every open socket, like the real processor. */
+    add(overrides = {}, { push = false } = {}) {
+      seq += 1;
+      const donation = {
+        id: "E" + seq,
+        seq: String(seq),
+        amount: 500,
+        currency: "BRL",
+        username: "Ana",
+        message: "vai!",
+        hasMessage: true,
+        flagged: false,
+        livepixId: "lp" + seq,
+        proof: "E" + seq,
+        reference: "r" + seq,
+        source: "message",
+        occurredAt: "2026-09-21T13:00:00.000Z",
+        receivedAt: "2026-09-21T13:00:01.000Z",
+        ...overrides,
+      };
+      donations.push(donation);
+      if (push) for (const ws of sockets) ws.send(JSON.stringify({ type: "donation", donation }));
+      return donation;
+    },
+    dropSockets(code = 1011) {
+      for (const ws of sockets) ws.close(code, "test");
+    },
+    async close() {
+      for (const ws of sockets) ws.terminate();
+      wss.close();
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+
+function reply(res, status, body) {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+function context(overrides = {}, vault = new Map()) {
   const controller = new AbortController();
   const actions = new Map();
   const triggers = [];
@@ -10,12 +110,11 @@ function context(overrides = {}, sharedSecrets = new Map()) {
   const logs = [];
   const config = {
     enabled: true,
-    readMessages: true,
-    pollSeconds: 15,
+    baseUrl: "http://127.0.0.1:1",
+    apiToken: TOKEN,
+    startAt: START,
+    pollSeconds: 2,
     currency: "BRL",
-    clientId: "client",
-    clientSecret: "secret",
-    processExisting: false,
     ...overrides,
   };
   return {
@@ -24,13 +123,14 @@ function context(overrides = {}, sharedSecrets = new Map()) {
     triggers,
     statuses,
     logs,
+    vault,
     ctx: {
       signal: controller.signal,
       config: { get: async () => config },
       secrets: {
-        get: async (key) => sharedSecrets.get(key) || null,
-        set: async (key, value) => { sharedSecrets.set(key, value); },
-        delete: async (key) => { sharedSecrets.delete(key); },
+        get: async (key) => vault.get(key) ?? null,
+        set: async (key, value) => { vault.set(key, value); },
+        delete: async (key) => { vault.delete(key); },
       },
       registerAction: (name, handler) => actions.set(name, handler),
       emitTrigger: (name, payload) => triggers.push({ name, payload }),
@@ -46,331 +146,332 @@ function context(overrides = {}, sharedSecrets = new Map()) {
   };
 }
 
-function wait(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+async function until(check, timeoutMs = 4000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() > deadline) throw new Error("condition not met in time");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
 }
 
-function jsonResponse(body, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
+const ids = (fixture) => fixture.triggers.map((t) => t.payload.eventKey.replace("livepix:donation:", ""));
+const lastStatus = (fixture) => fixture.statuses[fixture.statuses.length - 1];
 
-/** A fake LivePix: OAuth plus pages of payments and messages, newest first. */
-function fakeLivePix({ payments = [], messages = [], tokenStatus = 200, rateLimited = false } = {}) {
-  const calls = { token: 0, payments: 0, messages: 0 };
-  const scopes = [];
-  const install = () => {
-    globalThis.fetch = async (input, init) => {
-      const url = String(input);
-      if (url === "https://oauth.livepix.gg/oauth2/token") {
-        calls.token += 1;
-        assert.equal(init.method, "POST");
-        const body = String(init.body);
-        assert.match(body, /grant_type=client_credentials/);
-        assert.match(body, /client_secret=secret/);
-        scopes.push(new URLSearchParams(body).get("scope"));
-        if (tokenStatus !== 200) return jsonResponse({ error: "invalid_client" }, tokenStatus);
-        return jsonResponse({ access_token: "token", expires_in: 3600 });
-      }
-      const parsed = new URL(url);
-      assert.equal(init.headers.authorization, "Bearer token");
-      if (rateLimited) return jsonResponse({ error: "too many" }, 429);
-      const page = Number(parsed.searchParams.get("page"));
-      const limit = Number(parsed.searchParams.get("limit"));
-      const isPayments = parsed.pathname.endsWith("/payments");
-      calls[isPayments ? "payments" : "messages"] += 1;
-      const list = isPayments ? payments : messages;
-      return jsonResponse({ data: list.slice((page - 1) * limit, page * limit) });
-    };
-  };
-  return { calls, scopes, install };
-}
+test("reads the subathon start in the formats the field accepts, in local time", () => {
+  assert.equal(parseStartAt("2026-09-21 18:30"), new Date(2026, 8, 21, 18, 30).getTime());
+  assert.equal(parseStartAt("2026-09-21T18:30"), new Date(2026, 8, 21, 18, 30).getTime());
+  assert.equal(parseStartAt("21/09/2026 18:30"), new Date(2026, 8, 21, 18, 30).getTime());
+  assert.equal(parseStartAt("21/09/2026"), new Date(2026, 8, 21).getTime());
+  assert.equal(parseStartAt("2026-09-21T15:00:00.000Z"), Date.UTC(2026, 8, 21, 15));
+  assert.ok(Number.isNaN(parseStartAt("31/02/2026 10:00")));
+  assert.ok(Number.isNaN(parseStartAt("amanhã")));
+  assert.ok(Number.isNaN(parseStartAt("")));
+});
 
-const nativeFetch = globalThis.fetch;
+test("the token names its webhook", () => {
+  assert.equal(webhookIdFromToken(TOKEN), WEBHOOK);
+  assert.equal(webhookIdFromToken("olp_abc_x"), "");
+  assert.equal(webhookIdFromToken("not-a-token"), "");
+});
 
-for (const phase of ["oauth", "payments", "body"]) {
-  test(`SDK 0.5 cancels an in-flight ${phase} request and can reactivate`, { timeout: 3000 }, async () => {
-    let started;
-    const pending = new Promise((resolve) => { started = resolve; });
-    let requestSignal;
-    const fixture = context({ processExisting: true });
-    const blocked = (signal) => new Promise((resolve, reject) => {
-      requestSignal = signal;
-      started();
-      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-    });
-    globalThis.fetch = async (url, init) => {
-      if (String(url).includes("oauth2/token")) {
-        if (phase === "oauth") return blocked(init.signal);
-        return jsonResponse({ access_token: "token", expires_in: 3600 });
-      }
-      if (phase === "body") return { ok: true, status: 200, json: () => blocked(init.signal) };
-      return blocked(init.signal);
-    };
-    try {
-      await plugin.activate(fixture.ctx);
-      await pending;
-      const statusCount = fixture.statuses.length;
-      assert.equal((await fixture.actions.get("poll-now")({})).skipped, true);
-      fixture.controller.abort();
-      await plugin.deactivate();
-      assert.equal(requestSignal.aborted, true);
-      assert.equal(fixture.triggers.length, 0);
-      assert.equal(fixture.statuses.length, statusCount, "shutdown must not report a connection failure");
-      assert.equal(fixture.logs.length, 0);
-      fakeLivePix({}).install();
-      await plugin.activate(context({}).ctx);
-    } finally {
-      await plugin.deactivate();
-      globalThis.fetch = nativeFetch;
-    }
-  });
-}
-
-test("deactivate aborts without a host signal and disabled actions do not poll", { timeout: 3000 }, async () => {
-  let started;
-  const pending = new Promise((resolve) => { started = resolve; });
-  let requestSignal;
-  globalThis.fetch = async (url, { signal }) => new Promise((resolve, reject) => {
-    requestSignal = signal;
-    started();
-    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-  });
-  const fixture = context({});
-  delete fixture.ctx.signal;
+test("fires every donation since the subathon start once, oldest first, with the 1.x payload", async () => {
+  const dashboard = await fakeDashboard();
+  dashboard.add({ id: "BEFORE", occurredAt: "2026-09-21T11:59:59.000Z" });
+  dashboard.add({ id: "LATE", occurredAt: "2026-09-21T14:00:00.000Z" });
+  dashboard.add({ id: "EARLY", occurredAt: "2026-09-21T12:30:00.000Z", username: "", message: "" });
+  const fixture = context({ baseUrl: dashboard.baseUrl });
   try {
     await plugin.activate(fixture.ctx);
-    await pending;
-    await plugin.deactivate();
-    assert.equal(requestSignal.aborted, true);
-    let calls = 0;
-    globalThis.fetch = async () => { calls++; return jsonResponse({}); };
-    const disabled = context({ enabled: false });
-    await plugin.activate(disabled.ctx);
-    assert.equal((await disabled.actions.get("poll-now")({})).ok, false);
-    assert.equal(calls, 0);
+    await until(() => fixture.triggers.length === 2);
+    assert.deepEqual(ids(fixture), ["EARLY", "LATE"]);
+    const [first, second] = fixture.triggers;
+    assert.equal(first.name, "donation");
+    assert.equal(first.payload.hasMessage, false);
+    assert.deepEqual(second.payload, {
+      amount: 500,
+      amountFormatted: "R$ 5,00",
+      currency: "BRL",
+      username: "Ana",
+      message: "vai!",
+      hasMessage: true,
+      flagged: false,
+      id: "lp2",
+      proof: "E2",
+      reference: "r2",
+      createdAt: "2026-09-21T14:00:00.000Z",
+      eventKey: "livepix:donation:LATE",
+      actorId: "Ana",
+      actorDisplayName: "Ana",
+    });
+    assert.ok(dashboard.requests.some((r) => r.includes("since=2026-09-21T12%3A00%3A00.000Z")));
+    assert.ok(dashboard.state.authorization.every((value) => value === "Bearer " + TOKEN));
   } finally {
     await plugin.deactivate();
-    globalThis.fetch = nativeFetch;
+    await dashboard.close();
   }
 });
 
-test("one donation is one trigger: payment and message merge instead of firing twice", async () => {
-  const fake = fakeLivePix({
-    payments: [
-      { id: "pay-1", proof: "pix-1", amount: 1500, currency: "BRL", createdAt: "2026-01-01T00:00:00Z" },
-      { id: "pay-2", proof: "pix-2", amount: 500, currency: "BRL", createdAt: "2026-01-01T00:01:00Z" },
-    ],
-    messages: [
-      { id: "msg-1", proof: "pix-1", username: "Panda", message: "vai time", amount: 1500, currency: "BRL", createdAt: "2026-01-01T00:00:00Z" },
-    ],
-  });
-  fake.install();
-  const fixture = context({ processExisting: true });
+test("a donation pushed over the socket fires at once and never again from the API", async () => {
+  const dashboard = await fakeDashboard();
+  const fixture = context({ baseUrl: dashboard.baseUrl });
   try {
     await plugin.activate(fixture.ctx);
-    await wait(60);
-    assert.match(fake.scopes[0], /payments:read messages:read/);
-    assert.deepEqual(fixture.triggers.map((event) => event.name), ["donation", "donation"]);
-
-    const withMessage = fixture.triggers[0].payload;
-    assert.equal(withMessage.amount, 1500);
-    assert.equal(withMessage.username, "Panda");
-    assert.equal(withMessage.message, "vai time");
-    assert.equal(withMessage.hasMessage, true);
-    assert.equal(withMessage.actorDisplayName, "Panda");
-    assert.equal(withMessage.eventKey, "livepix:donation:pix-1");
-
-    const plain = fixture.triggers[1].payload;
-    assert.equal(plain.amount, 500);
-    assert.equal(plain.hasMessage, false);
-    assert.equal(plain.username, "");
-    assert.equal(plain.message, "");
-  } finally {
-    await plugin.deactivate();
-    globalThis.fetch = nativeFetch;
-  }
-});
-
-test("first poll only marks history as seen; the next poll fires new donations once", async () => {
-  const fake = fakeLivePix({
-    payments: [
-      { id: "old-1", proof: "p1", amount: 1000, currency: "BRL", createdAt: "2026-01-01T00:00:00Z" },
-    ],
-  });
-  fake.install();
-  const secrets = new Map();
-  const fixture = context({}, secrets);
-  try {
-    await plugin.activate(fixture.ctx);
-    await wait(50);
-    assert.equal(fixture.triggers.length, 0);
-
-    const fresh = fakeLivePix({
-      payments: [
-        { id: "new-2", proof: "p3", amount: 2500, currency: "BRL", createdAt: "2026-01-02T00:00:10Z" },
-        { id: "new-1", proof: "p2", amount: 500, currency: "BRL", createdAt: "2026-01-02T00:00:00Z" },
-        { id: "old-1", proof: "p1", amount: 1000, currency: "BRL", createdAt: "2026-01-01T00:00:00Z" },
-        { id: "usd", proof: "p4", amount: 700, currency: "USD", createdAt: "2026-01-02T00:00:20Z" },
-      ],
-    });
-    fresh.install();
-    const result = await fixture.actions.get("poll-now")({});
-    assert.equal(result.ok, true);
-    assert.equal(result.emitted, 2);
-    assert.deepEqual(
-      fixture.triggers.map((event) => event.payload.amount),
-      [500, 2500],
-      "oldest first, foreign currency ignored",
-    );
-    assert.equal(fixture.triggers[0].payload.amountFormatted.replace(/ /g, " "), "R$ 5,00");
-
-    const again = await fixture.actions.get("poll-now")({});
-    assert.equal(again.emitted, 0);
+    await until(() => dashboard.sockets.size === 1 && lastStatus(fixture)?.connectionState === "tempo real (WebSocket)");
+    dashboard.add({ id: "LIVE" }, { push: true });
+    await until(() => fixture.triggers.length === 1);
+    const sync = await fixture.actions.get("poll-now")({});
+    assert.equal(sync.ok, true);
+    assert.equal(sync.fetched, 1);
+    assert.equal(sync.emitted, 0);
+    assert.deepEqual(ids(fixture), ["LIVE"]);
     const status = await fixture.actions.get("status")({});
-    assert.equal(status.connected, true);
-    assert.equal(status.emittedSinceStart, 2);
-    assert.equal(fixture.statuses.at(-1).health, "healthy");
+    assert.equal(status.transport, "websocket");
+    assert.equal(status.seen, 1);
   } finally {
     await plugin.deactivate();
-    globalThis.fetch = nativeFetch;
+    await dashboard.close();
   }
+});
 
-  // The seen ledger survives a restart, so the same donations never fire twice.
-  const fresh = fakeLivePix({
-    payments: [
-      { id: "new-2", proof: "p3", amount: 2500, currency: "BRL", createdAt: "2026-01-02T00:00:10Z" },
-    ],
-  });
-  fresh.install();
-  const second = context({}, secrets);
+test("after a restart it fires only what arrived while it was off", async () => {
+  const dashboard = await fakeDashboard();
+  const vault = new Map();
+  dashboard.add({ id: "A" });
+  dashboard.add({ id: "B" });
+  const first = context({ baseUrl: dashboard.baseUrl }, vault);
+  try {
+    await plugin.activate(first.ctx);
+    await until(() => first.triggers.length === 2);
+  } finally {
+    await plugin.deactivate();
+  }
+  // Studio closed: the dashboard keeps receiving donations.
+  dashboard.add({ id: "C" });
+  dashboard.add({ id: "D" });
+  const second = context({ baseUrl: dashboard.baseUrl }, vault);
   try {
     await plugin.activate(second.ctx);
-    await wait(50);
-    assert.equal(second.triggers.length, 0);
+    await until(() => second.triggers.length === 2);
+    await second.actions.get("poll-now")({});
+    assert.deepEqual(ids(second), ["C", "D"]);
   } finally {
     await plugin.deactivate();
-    globalThis.fetch = nativeFetch;
+    await dashboard.close();
   }
 });
 
-test("a message with no matching payment still fires exactly once", async () => {
-  const fake = fakeLivePix({
-    payments: [],
-    messages: [
-      { id: "msg-9", proof: "pix-9", username: "Solo", message: "oi", amount: 700, currency: "BRL", createdAt: "2026-01-03T00:00:00Z" },
-    ],
-  });
-  fake.install();
-  const fixture = context({ processExisting: true });
+test("without the socket it polls the API at the configured interval", async () => {
+  const dashboard = await fakeDashboard({ rejectSocket: 503 });
+  const fixture = context({ baseUrl: dashboard.baseUrl, pollSeconds: 2 });
   try {
     await plugin.activate(fixture.ctx);
-    await wait(60);
-    assert.equal(fixture.triggers.length, 1);
-    assert.equal(fixture.triggers[0].payload.username, "Solo");
-    const again = await fixture.actions.get("poll-now")({});
-    assert.equal(again.emitted, 0);
-  } finally {
-    await plugin.deactivate();
-    globalThis.fetch = nativeFetch;
-  }
-});
-
-test("messages off asks only for payments:read and never calls the messages endpoint", async () => {
-  const fake = fakeLivePix({
-    payments: [{ id: "pay-1", proof: "pix-1", amount: 900, currency: "BRL", createdAt: "2026-01-01T00:00:00Z" }],
-    messages: [{ id: "msg-1", proof: "pix-1", username: "Panda", message: "oi", amount: 900, currency: "BRL" }],
-  });
-  fake.install();
-  const fixture = context({ readMessages: false, processExisting: true });
-  try {
-    await plugin.activate(fixture.ctx);
-    await wait(60);
-    assert.equal(fake.scopes[0], "payments:read");
-    assert.equal(fake.calls.messages, 0);
-    assert.equal(fixture.triggers.length, 1);
-    assert.equal(fixture.triggers[0].payload.hasMessage, false);
-  } finally {
-    await plugin.deactivate();
-    globalThis.fetch = nativeFetch;
-  }
-});
-
-test("a ledger written by 1.0.0 re-baselines instead of replaying every donation", async () => {
-  const secrets = new Map();
-  secrets.set(
-    "livepix-state-v1",
-    JSON.stringify({ version: 1, initialized: true, seen: ["payments:old-1"], lastPollAt: "2026-01-01T00:00:00Z" }),
-  );
-  const fake = fakeLivePix({
-    payments: [{ id: "old-1", proof: "p1", amount: 1000, currency: "BRL", createdAt: "2026-01-01T00:00:00Z" }],
-  });
-  fake.install();
-  const fixture = context({ processExisting: true }, secrets);
-  try {
-    await plugin.activate(fixture.ctx);
-    await wait(60);
-    assert.equal(fixture.triggers.length, 0, "an upgrade must never credit a past donation again");
-    assert.ok(fixture.logs.some((line) => line.includes("linha de base")));
-    const after = await fixture.actions.get("poll-now")({});
-    assert.equal(after.emitted, 0);
-  } finally {
-    await plugin.deactivate();
-    globalThis.fetch = nativeFetch;
-  }
-});
-
-test("bad credentials degrade the status and never crash activation", async () => {
-  const fake = fakeLivePix({ tokenStatus: 401 });
-  fake.install();
-  const fixture = context({});
-  try {
-    await plugin.activate(fixture.ctx);
-    await wait(50);
+    await until(() => lastStatus(fixture)?.connectionState?.startsWith("consultando a API a cada 2 s"));
+    assert.equal(lastStatus(fixture).health, "degraded");
+    dashboard.add({ id: "POLLED" });
+    await until(() => fixture.triggers.length === 1, 4000);
+    assert.deepEqual(ids(fixture), ["POLLED"]);
     const status = await fixture.actions.get("status")({});
-    assert.equal(status.connected, false);
-    assert.match(status.lastError, /HTTP 401/);
-    assert.match(status.lastError, /payments:read/, "the message names the scopes the app needs");
-    assert.equal(fixture.statuses.at(-1).health, "degraded");
-    assert.ok(!fixture.logs.join("\n").includes("secret"));
+    assert.equal(status.transport, "polling");
+    // The next poll continues after the last sequence number instead of rereading everything.
+    await until(() => dashboard.requests.some((r) => r.includes("after=1")), 4000);
   } finally {
     await plugin.deactivate();
-    globalThis.fetch = nativeFetch;
+    await dashboard.close();
   }
 });
 
-test("missing credentials wait instead of polling", async () => {
-  let called = false;
-  globalThis.fetch = async () => { called = true; return jsonResponse({}); };
-  const fixture = context({ clientId: "", clientSecret: "***" });
+test("reconnects after the socket drops and reads what it missed", async () => {
+  const dashboard = await fakeDashboard();
+  const fixture = context({ baseUrl: dashboard.baseUrl, pollSeconds: 300 });
   try {
     await plugin.activate(fixture.ctx);
-    await wait(30);
-    assert.equal(called, false);
-    assert.equal(fixture.statuses.at(-1).connectionState, "aguardando credenciais");
-    const result = await fixture.actions.get("poll-now")({});
-    assert.equal(result.ok, false);
+    await until(() => dashboard.sockets.size === 1);
+    dashboard.state.rejectSocket = 503;
+    dashboard.dropSockets();
+    await until(() => dashboard.sockets.size === 0);
+    dashboard.add({ id: "MISSED" }, { push: true });
+    dashboard.state.rejectSocket = 0;
+    // First retry comes after one second; the reconnect runs a full sync from the start.
+    await until(() => fixture.triggers.length === 1, 5000);
+    assert.deepEqual(ids(fixture), ["MISSED"]);
+    assert.equal(dashboard.sockets.size, 1);
   } finally {
     await plugin.deactivate();
-    globalThis.fetch = nativeFetch;
+    await dashboard.close();
   }
 });
 
-test("a 429 answer backs off instead of hammering the API", async () => {
-  const fake = fakeLivePix({ rateLimited: true });
-  fake.install();
-  const fixture = context({});
+test("ignores other currencies and zero amounts without firing them later", async () => {
+  const dashboard = await fakeDashboard();
+  dashboard.add({ id: "USD", currency: "USD" });
+  dashboard.add({ id: "ZERO", amount: 0 });
+  dashboard.add({ id: "OK" });
+  const fixture = context({ baseUrl: dashboard.baseUrl });
   try {
     await plugin.activate(fixture.ctx);
-    await wait(50);
-    const result = await fixture.actions.get("poll-now")({});
-    assert.equal(result.ok, false);
-    assert.match(result.error, /429/);
-    assert.equal(fixture.statuses.at(-1).health, "degraded");
+    await until(() => fixture.triggers.length === 1);
+    await fixture.actions.get("poll-now")({});
+    assert.deepEqual(ids(fixture), ["OK"]);
   } finally {
     await plugin.deactivate();
-    globalThis.fetch = nativeFetch;
+    await dashboard.close();
+  }
+});
+
+test("without a subathon start it counts from the first activation, never the history", async () => {
+  const dashboard = await fakeDashboard();
+  dashboard.add({ id: "OLD", occurredAt: new Date(Date.now() - 60_000).toISOString() });
+  const vault = new Map();
+  const fixture = context({ baseUrl: dashboard.baseUrl, startAt: "" }, vault);
+  try {
+    await plugin.activate(fixture.ctx);
+    const sync = await fixture.actions.get("poll-now")({});
+    assert.equal(sync.ok, true);
+    dashboard.add({ id: "NEW", occurredAt: new Date(Date.now() + 1000).toISOString() }, { push: true });
+    await until(() => fixture.triggers.length === 1);
+    assert.deepEqual(ids(fixture), ["NEW"]);
+    const saved = JSON.parse(vault.get("livepix-state-v1"));
+    assert.ok(saved.autoStartAt > 0, "the automatic start survives a restart");
+  } finally {
+    await plugin.deactivate();
+    await dashboard.close();
+  }
+});
+
+test("donations counted by 1.2.0 stay counted after the update", async () => {
+  const dashboard = await fakeDashboard();
+  dashboard.add({ id: "E-OLD", occurredAt: new Date(Date.now() + 1000).toISOString() });
+  dashboard.add({ id: "E-NEW", occurredAt: new Date(Date.now() + 2000).toISOString() });
+  const vault = new Map([["livepix-state-v1", JSON.stringify({ version: 2, initialized: true, seen: ["livepix:E-OLD"], lastPollAt: "" })]]);
+  const fixture = context({ baseUrl: dashboard.baseUrl, startAt: "2026-01-01 00:00" }, vault);
+  try {
+    await plugin.activate(fixture.ctx);
+    await until(() => fixture.triggers.length === 1);
+    await fixture.actions.get("poll-now")({});
+    assert.deepEqual(ids(fixture), ["E-NEW"]);
+    assert.equal(JSON.parse(vault.get("livepix-state-v1")).version, 3);
+  } finally {
+    await plugin.deactivate();
+    await dashboard.close();
+  }
+});
+
+test("a refused token degrades the status with the reason", async () => {
+  const dashboard = await fakeDashboard();
+  const fixture = context({ baseUrl: dashboard.baseUrl, apiToken: `olp_${WEBHOOK}_wrong` });
+  try {
+    await plugin.activate(fixture.ctx);
+    await until(() => (lastStatus(fixture)?.errors ?? []).some((e) => e.includes("Token recusado")));
+    assert.equal(lastStatus(fixture).health, "degraded");
+    assert.ok(lastStatus(fixture).errors.some((e) => e.includes("token recusado")));
+    assert.equal(fixture.triggers.length, 0);
+  } finally {
+    await plugin.deactivate();
+    await dashboard.close();
+  }
+});
+
+test("an incomplete configuration waits instead of connecting", async () => {
+  for (const [overrides, reason] of [
+    [{ apiToken: "" }, /Informe o token/],
+    [{ apiToken: "abc" }, /formato/],
+    [{ startAt: "ontem" }, /Início do subathon inválido/],
+    [{ baseUrl: "http://livepix.example.com" }, /https/],
+  ]) {
+    const fixture = context(overrides);
+    try {
+      await plugin.activate(fixture.ctx);
+      assert.equal(lastStatus(fixture).health, "degraded");
+      assert.match(lastStatus(fixture).errors[0], reason);
+      const action = await fixture.actions.get("poll-now")({});
+      assert.equal(action.ok, false);
+    } finally {
+      await plugin.deactivate();
+    }
+  }
+});
+
+test("disabled, it neither connects nor polls", async () => {
+  const dashboard = await fakeDashboard();
+  const fixture = context({ baseUrl: dashboard.baseUrl, enabled: false });
+  try {
+    await plugin.activate(fixture.ctx);
+    assert.equal(lastStatus(fixture).connectionState, "desativado");
+    assert.equal((await fixture.actions.get("poll-now")({})).ok, false);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(dashboard.requests.length, 0);
+    assert.equal(dashboard.sockets.size, 0);
+  } finally {
+    await plugin.deactivate();
+    await dashboard.close();
+  }
+});
+
+test("the host abort signal stops the socket and the timers, and it can activate again", async () => {
+  const dashboard = await fakeDashboard();
+  const fixture = context({ baseUrl: dashboard.baseUrl });
+  try {
+    await plugin.activate(fixture.ctx);
+    await until(() => dashboard.sockets.size === 1);
+    fixture.controller.abort();
+    await plugin.deactivate();
+    await until(() => dashboard.sockets.size === 0);
+    const again = context({ baseUrl: dashboard.baseUrl });
+    await plugin.activate(again.ctx);
+    await until(() => dashboard.sockets.size === 1);
+  } finally {
+    await plugin.deactivate();
+    await dashboard.close();
+  }
+});
+
+test("the WebSocket client reads fragmented, large and ping frames", async () => {
+  const server = http.createServer();
+  const wss = new WebSocketServer({ server });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const big = "x".repeat(70_000);
+  const received = [];
+  let pongs = 0;
+  wss.on("connection", (ws) => {
+    ws.on("pong", () => { pongs += 1; });
+    ws.on("message", (data) => ws.send("echo:" + String(data)));
+    ws.ping("hi");
+    ws.send("small");
+    ws.send(big);
+    ws.send("frag", { fin: false });
+    ws.send("mented", { fin: true });
+  });
+  let closed;
+  const done = new Promise((resolve) => { closed = resolve; });
+  const client = connectWebSocket(`ws://127.0.0.1:${server.address().port}/`, {}, {
+    onOpen: () => client.send("hello"),
+    onMessage: (text) => received.push(text),
+    onClose: (code) => closed(code),
+  });
+  try {
+    await until(() => received.length === 4);
+    assert.deepEqual(received.map((text) => text.length > 100 ? `big:${text.length}` : text), ["small", "big:70000", "fragmented", "echo:hello"]);
+    await until(() => pongs === 1);
+    client.close(1000);
+    assert.equal(await done, 1000);
+  } finally {
+    wss.close();
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("the WebSocket client maps a refused handshake to a close code", async () => {
+  const server = http.createServer((req, res) => { res.writeHead(401); res.end(); });
+  server.on("upgrade", (req, socket) => socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n"));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const code = await new Promise((resolve) => {
+      connectWebSocket(`ws://127.0.0.1:${server.address().port}/`, {}, { onMessage: () => {}, onClose: resolve });
+    });
+    assert.equal(code, 4001);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
   }
 });

@@ -1,29 +1,42 @@
 /**
  * LivePix for OSC Flow Studio.
  *
- * Polls the LivePix v2 API with OAuth2 client credentials and turns every new
- * donation into one trigger. No public webhook, no tunnel: everything runs from
- * the user's machine. The client secret lives in the app's vault and only ever
- * travels to oauth.livepix.gg.
+ * Donations come from the OSC LivePix Dashboard, which receives the LivePix
+ * webhook, reads each donation from the LivePix API and keeps every one of
+ * them. The plugin holds one WebSocket to the dashboard for real-time delivery
+ * and reads the dashboard API when the socket is down, after every reconnect
+ * and every few minutes as a safety net.
  *
- * One donation is one event. /v2/payments is the canonical list and
- * /v2/messages only carries the donations that came with text, so the two are
- * merged by proof before anything fires. Reading them as separate streams was
- * the 1.0.0 mistake: a donation with a message fired twice and a flow that
- * credited both counted it twice.
+ * Whatever the path, a donation fires at most once: its id is written to the
+ * vault before the trigger is emitted, and only donations from the subathon
+ * start onwards are considered. A crash, a restart or a long disconnection
+ * therefore never loses a donation that the dashboard kept, and never credits
+ * one twice.
  */
 
+import { createHash, randomBytes } from "node:crypto";
+import http from "node:http";
+import https from "node:https";
+
 const STATE_KEY = "livepix-state-v1";
-const STATE_VERSION = 2;
-const TOKEN_URL = "https://oauth.livepix.gg/oauth2/token";
-const API_BASE = "https://api.livepix.gg/v2/";
-const PAGE_LIMIT = 100;
-const MAX_PAGES_PER_POLL = 3;
-const MAX_SEEN_KEYS = 2000;
+const STATE_VERSION = 3;
+const DEFAULT_BASE_URL = "https://livepix.maned.club";
+const PAGE_LIMIT = 500;
+const MAX_PAGES_PER_SYNC = 60;
+const MAX_PROCESSED = 10_000;
 const REQUEST_TIMEOUT_MS = 10_000;
-const MAX_BACKOFF_MS = 300_000;
+/** While the socket is up, a full read from the subathon start still runs this often. */
+const RECONCILE_MS = 5 * 60_000;
+/** The dashboard sends a heartbeat every 25 s; this much silence means the socket is dead. */
+const SOCKET_SILENCE_MS = 70_000;
+const MAX_RECONNECT_MS = 60_000;
+const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 let activeRuntime = null;
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
 
 function asNumber(value, fallback, min, max) {
   const parsed = Number(value);
@@ -43,24 +56,86 @@ function describe(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * Reads the subathon start typed by the user, in the machine's local time.
+ * Accepts `2026-09-21 18:00`, `2026-09-21T18:00`, `21/09/2026 18:00`, a date
+ * alone (midnight) or a full ISO timestamp. Returns NaN when it cannot.
+ */
+export function parseStartAt(raw) {
+  const text = typeof raw === "string" ? raw.trim() : "";
+  if (!text) return NaN;
+  if (/[zZ]$|[+-]\d{2}:?\d{2}$/.test(text)) return Date.parse(text);
+  let match = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$/.exec(text);
+  let parts = match ? [match[1], match[2], match[3], match[4], match[5], match[6]] : null;
+  if (!parts) {
+    match = /^(\d{2})\/(\d{2})\/(\d{4})(?: (\d{2}):(\d{2})(?::(\d{2}))?)?$/.exec(text);
+    parts = match ? [match[3], match[2], match[1], match[4], match[5], match[6]] : null;
+  }
+  if (!parts) return NaN;
+  const [year, month, day, hour = "0", minute = "0", second = "0"] = parts.map((part) => part ?? undefined);
+  const date = new Date(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second));
+  // new Date() rolls 31/02 over into March; a date that moved was not a real date.
+  if (date.getFullYear() !== Number(year) || date.getMonth() !== Number(month) - 1 || date.getDate() !== Number(day)) {
+    return NaN;
+  }
+  return date.getTime();
+}
+
+/** `olp_<webhookId>_<secret>`: the token names the webhook it opens. */
+export function webhookIdFromToken(token) {
+  const match = /^olp_([A-Za-z0-9]{8,64})_[A-Za-z0-9_-]+$/.exec(token);
+  return match ? match[1] : "";
+}
+
+function normalizeBaseUrl(raw) {
+  const text = asText(raw, DEFAULT_BASE_URL).replace(/\/+$/, "");
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    return { value: "", error: "URL base inválida: " + text };
+  }
+  const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && local)) {
+    return { value: "", error: "A URL base precisa usar https:// (http só é aceito para localhost)." };
+  }
+  return { value: url.origin + url.pathname.replace(/\/+$/, ""), error: "" };
+}
+
 function normalizeConfig(raw) {
+  const base = normalizeBaseUrl(raw.baseUrl);
+  const apiToken = asSecret(raw.apiToken);
+  const startAtText = asText(raw.startAt, "");
   return {
     enabled: raw.enabled !== false,
-    readMessages: raw.readMessages !== false,
-    pollSeconds: Math.round(asNumber(raw.pollSeconds, 30, 15, 300)),
+    baseUrl: base.value,
+    baseUrlError: base.error,
+    apiToken,
+    webhookId: webhookIdFromToken(apiToken),
+    startAtText,
+    startAtMs: startAtText ? parseStartAt(startAtText) : NaN,
+    pollSeconds: Math.round(asNumber(raw.pollSeconds, 10, 2, 300)),
     currency: asText(raw.currency, "BRL").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 10) || "BRL",
-    clientId: asText(raw.clientId, ""),
-    clientSecret: asSecret(raw.clientSecret),
-    processExisting: raw.processExisting === true,
   };
 }
 
-function scopeFor(config) {
-  return config.readMessages ? "payments:read messages:read" : "payments:read";
+/** Why the plugin cannot run with this configuration, or "" when it can. */
+function configProblem(config) {
+  if (config.baseUrlError) return config.baseUrlError;
+  if (!config.apiToken) return "Informe o token gerado no OSC LivePix Dashboard.";
+  if (!config.webhookId) return "O token não tem o formato do OSC LivePix Dashboard. Copie-o de novo.";
+  if (config.startAtText && Number.isNaN(config.startAtMs)) {
+    return "Início do subathon inválido. Use AAAA-MM-DD HH:mm ou DD/MM/AAAA HH:mm.";
+  }
+  return "";
 }
 
+// ---------------------------------------------------------------------------
+// Persisted state: which donations already fired
+// ---------------------------------------------------------------------------
+
 function initialState() {
-  return { version: STATE_VERSION, initialized: false, seen: [], lastPollAt: "", forceBaseline: false };
+  return { version: STATE_VERSION, processed: [], autoStartAt: 0, lastSeq: "0", lastSyncAt: "" };
 }
 
 function hydrateState(raw, log) {
@@ -68,20 +143,26 @@ function hydrateState(raw, log) {
   try {
     const parsed = JSON.parse(raw);
     const next = initialState();
-    if (Number(parsed.version) !== STATE_VERSION) {
-      // 1.0.0 keyed the ledger per resource (payments:<id>, messages:<id>);
-      // 1.1.0 keys one donation by proof. Replaying the old keys against the
-      // new format would re-fire every past donation, so the next poll takes a
-      // fresh baseline instead and nothing is credited twice.
-      log.warn("estado da versão anterior encontrado; a próxima consulta refaz a linha de base sem disparar gatilhos");
-      next.forceBaseline = true;
+    if (Number(parsed.version) === 2) {
+      // 1.2.0 kept `livepix:<proof>` keys from its own polling. The dashboard delivers the
+      // same proof as the donation id, so those donations stay counted after the update.
+      const now = Date.now();
+      next.processed = (Array.isArray(parsed.seen) ? parsed.seen : [])
+        .filter((key) => typeof key === "string" && key.startsWith("livepix:"))
+        .map((key) => [key.slice("livepix:".length), now]);
+      log.info(String(next.processed.length) + " doação(ões) da versão anterior mantidas como já processadas");
       return next;
     }
-    next.initialized = parsed.initialized === true;
-    next.seen = Array.isArray(parsed.seen)
-      ? parsed.seen.filter((key) => typeof key === "string").slice(-MAX_SEEN_KEYS)
+    if (Number(parsed.version) !== STATE_VERSION) {
+      log.warn("estado de uma versão desconhecida; começando do zero a partir do início do subathon");
+      return next;
+    }
+    next.processed = Array.isArray(parsed.processed)
+      ? parsed.processed.filter((entry) => Array.isArray(entry) && typeof entry[0] === "string" && Number.isFinite(entry[1]))
       : [];
-    next.lastPollAt = typeof parsed.lastPollAt === "string" ? parsed.lastPollAt : "";
+    next.autoStartAt = Number.isFinite(parsed.autoStartAt) ? parsed.autoStartAt : 0;
+    next.lastSeq = typeof parsed.lastSeq === "string" && /^\d+$/.test(parsed.lastSeq) ? parsed.lastSeq : "0";
+    next.lastSyncAt = typeof parsed.lastSyncAt === "string" ? parsed.lastSyncAt : "";
     return next;
   } catch (error) {
     log.warn("estado persistido inválido; começando do zero: " + describe(error));
@@ -90,6 +171,7 @@ function hydrateState(raw, log) {
 }
 
 async function persist(runtime) {
+  runtime.state.processed = [...runtime.processed.entries()];
   try {
     await runtime.ctx.secrets.set(STATE_KEY, JSON.stringify(runtime.state));
   } catch (error) {
@@ -97,12 +179,26 @@ async function persist(runtime) {
   }
 }
 
-/** One donation, however it was read. Proof is the id LivePix shares between the two lists. */
-function donationKey(item) {
-  return asText(item && item.proof, "")
-    || asText(item && item.reference, "")
-    || asText(item && item.id, "");
+/** The subathon start in effect: the configured one, else the first activation without one. */
+function startAtMs(runtime) {
+  return Number.isFinite(runtime.config.startAtMs) ? runtime.config.startAtMs : runtime.state.autoStartAt;
 }
+
+/** Forgets donations before the start (they can never fire) and caps the ledger. */
+function pruneProcessed(runtime) {
+  const start = startAtMs(runtime);
+  for (const [key, at] of runtime.processed) {
+    if (at < start) runtime.processed.delete(key);
+  }
+  if (runtime.processed.size > MAX_PROCESSED) {
+    const oldest = [...runtime.processed.entries()].sort((a, b) => a[1] - b[1]);
+    for (const [key] of oldest.slice(0, runtime.processed.size - MAX_PROCESSED)) runtime.processed.delete(key);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Donations
+// ---------------------------------------------------------------------------
 
 function formatAmount(cents, currency) {
   const value = cents / 100;
@@ -113,276 +209,492 @@ function formatAmount(cents, currency) {
   }
 }
 
-function markSeen(runtime, key) {
-  runtime.seenSet.add(key);
-  runtime.state.seen.push(key);
-  if (runtime.state.seen.length > MAX_SEEN_KEYS) {
-    const dropped = runtime.state.seen.splice(0, runtime.state.seen.length - MAX_SEEN_KEYS);
-    for (const old of dropped) runtime.seenSet.delete(old);
-  }
-}
-
-async function getToken(runtime) {
-  if (runtime.token && Date.now() < runtime.token.expiresAt - 60_000) {
-    return runtime.token.value;
-  }
-  const body = new URLSearchParams({
-    grant_type: "client_credentials",
-    client_id: runtime.config.clientId,
-    client_secret: runtime.config.clientSecret,
-    scope: scopeFor(runtime.config),
-  });
-  const response = await fetch(TOKEN_URL, {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
-    body,
-    signal: AbortSignal.any([runtime.controller.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
-  });
-  if (!response.ok) {
-    throw new Error(
-      "OAuth LivePix respondeu HTTP " + String(response.status)
-      + " (confira Client ID, Client Secret e se o aplicativo tem os escopos "
-      + scopeFor(runtime.config) + ")",
-    );
-  }
-  const payload = await response.json();
-  runtime.controller.signal.throwIfAborted();
-  if (!payload || typeof payload.access_token !== "string") {
-    throw new Error("OAuth LivePix não devolveu access_token");
-  }
-  runtime.token = {
-    value: payload.access_token,
-    expiresAt: Date.now() + Math.max(60, Number(payload.expires_in) || 3600) * 1000,
-  };
-  return runtime.token.value;
-}
-
-class RateLimitedError extends Error {
-  constructor(resource) {
-    super("LivePix limitou as requisições de " + resource + " (HTTP 429)");
-    this.name = "RateLimitedError";
-  }
-}
-
-async function fetchPage(runtime, resource, page, retry = true) {
-  const token = await getToken(runtime);
-  runtime.controller.signal.throwIfAborted();
-  const url = new URL(API_BASE + resource);
-  url.searchParams.set("page", String(page));
-  url.searchParams.set("limit", String(PAGE_LIMIT));
-  url.searchParams.set("currency", runtime.config.currency);
-  const response = await fetch(url, {
-    headers: { authorization: "Bearer " + token, accept: "application/json" },
-    signal: AbortSignal.any([runtime.controller.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
-  });
-  if (response.status === 401 && retry) {
-    runtime.token = null;
-    return fetchPage(runtime, resource, page, false);
-  }
-  if (response.status === 429) {
-    throw new RateLimitedError(resource);
-  }
-  if (!response.ok) {
-    throw new Error("LivePix " + resource + " respondeu HTTP " + String(response.status));
-  }
-  const payload = await response.json();
-  runtime.controller.signal.throwIfAborted();
-  return Array.isArray(payload && payload.data) ? payload.data : [];
-}
-
-/**
- * Reads pages newest-first until a page brings nothing unseen. A baseline poll
- * reads a single page: it only needs to learn what already exists.
- */
-async function fetchResource(runtime, resource, singlePage) {
-  const items = [];
-  for (let page = 1; page <= (singlePage ? 1 : MAX_PAGES_PER_POLL); page += 1) {
-    const data = await fetchPage(runtime, resource, page);
-    let unseen = 0;
-    for (const item of data) {
-      if (!item || typeof item !== "object") continue;
-      const key = donationKey(item);
-      if (!key) continue;
-      items.push(item);
-      if (!runtime.seenSet.has("livepix:" + key)) unseen += 1;
-    }
-    if (data.length < PAGE_LIMIT || unseen === 0) break;
-  }
-  return items;
-}
-
-function isValidItem(runtime, item) {
-  return Number(item.amount) > 0
-    && String(item.currency || "").toUpperCase() === runtime.config.currency;
-}
-
-function buildPayload(runtime, donation) {
+function buildPayload(donation) {
   const amount = Math.round(Number(donation.amount));
+  const currency = asText(donation.currency, "BRL");
   const username = asText(donation.username, "");
   const message = asText(donation.message, "");
   return {
     amount,
-    amountFormatted: formatAmount(amount, runtime.config.currency),
-    currency: runtime.config.currency,
+    amountFormatted: formatAmount(amount, currency),
+    currency,
     username,
     message,
     hasMessage: message.length > 0,
     flagged: donation.flagged === true,
-    id: asText(donation.id, ""),
+    id: asText(donation.livepixId, ""),
     proof: asText(donation.proof, ""),
     reference: asText(donation.reference, ""),
-    createdAt: asText(donation.createdAt, new Date().toISOString()),
-    eventKey: "livepix:donation:" + donationKey(donation),
+    createdAt: asText(donation.occurredAt, new Date().toISOString()),
+    eventKey: "livepix:donation:" + donation.id,
     actorId: username,
     actorDisplayName: username,
   };
 }
 
-/**
- * Payments are the canonical list; messages only add the name and the text of
- * the donations that carried one. A message with no payment in this window
- * still counts, so nothing is lost when the two lists disagree for a moment.
- */
-function mergeDonations(payments, messages) {
-  const byKey = new Map();
-  for (const payment of payments) {
-    byKey.set(donationKey(payment), { ...payment });
+function seqAbove(a, b) {
+  try {
+    return BigInt(a) > BigInt(b);
+  } catch {
+    return false;
   }
-  for (const message of messages) {
-    const key = donationKey(message);
-    const existing = byKey.get(key);
-    if (existing) {
-      existing.username = message.username;
-      existing.message = message.message;
-      existing.flagged = message.flagged;
-    } else {
-      byKey.set(key, { ...message });
-    }
-  }
-  return [...byKey.values()];
 }
 
-function poll(runtime, reason) {
+/**
+ * Takes donations from either path. Each new one is marked as processed and the
+ * ledger is written to the vault before any trigger fires.
+ */
+function accept(runtime, donations) {
+  const work = acceptNow(runtime, donations);
+  runtime.inFlight.add(work);
+  return work.finally(() => runtime.inFlight.delete(work));
+}
+
+async function acceptNow(runtime, donations) {
+  const start = startAtMs(runtime);
+  const fresh = [];
+  for (const donation of donations) {
+    if (!donation || typeof donation !== "object" || typeof donation.id !== "string" || !donation.id) continue;
+    if (typeof donation.seq === "string" && seqAbove(donation.seq, runtime.state.lastSeq)) {
+      runtime.state.lastSeq = donation.seq;
+    }
+    if (runtime.processed.has(donation.id)) continue;
+    const at = Date.parse(donation.occurredAt);
+    if (!Number.isFinite(at) || at < start) continue;
+    runtime.processed.set(donation.id, at);
+    const amount = Number(donation.amount);
+    const currency = String(donation.currency || "").toUpperCase();
+    if (!(amount > 0) || currency !== runtime.config.currency) continue;
+    fresh.push({ donation, at });
+  }
+  if (fresh.length === 0) return 0;
+  pruneProcessed(runtime);
+  await persist(runtime);
+  if (runtime.stopped) {
+    // Deactivated between the write and the triggers: forget them again, so the final
+    // write in deactivate() leaves them unprocessed and the next activation fires them.
+    for (const { donation } of fresh) runtime.processed.delete(donation.id);
+    return 0;
+  }
+  fresh.sort((a, b) => a.at - b.at);
+  for (const { donation } of fresh) {
+    runtime.ctx.emitTrigger("donation", buildPayload(donation));
+    runtime.emittedSinceStart += 1;
+  }
+  return fresh.length;
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard API (fallback and reconciliation)
+// ---------------------------------------------------------------------------
+
+class AuthError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "AuthError";
+  }
+}
+
+function authHeaders(runtime) {
+  return { authorization: "Bearer " + runtime.config.apiToken, accept: "application/json" };
+}
+
+async function fetchPage(runtime, since, after) {
+  const url = new URL(runtime.config.baseUrl + "/" + runtime.config.webhookId + "/api/donations");
+  url.searchParams.set("since", since);
+  url.searchParams.set("limit", String(PAGE_LIMIT));
+  if (after && after !== "0") url.searchParams.set("after", after);
+  const response = await fetch(url, {
+    headers: authHeaders(runtime),
+    signal: AbortSignal.any([runtime.controller.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
+  });
+  if (response.status === 401) throw new AuthError("Token recusado pelo dashboard. Gere outro e cole no plugin.");
+  if (response.status === 403) throw new AuthError("O webhook está inativo no OSC LivePix Dashboard.");
+  if (!response.ok) throw new Error("OSC LivePix Dashboard respondeu HTTP " + String(response.status));
+  const payload = await response.json();
+  runtime.controller.signal.throwIfAborted();
+  return {
+    donations: Array.isArray(payload && payload.donations) ? payload.donations : [],
+    nextAfter: typeof payload?.nextAfter === "string" ? payload.nextAfter : after,
+    hasMore: payload?.hasMore === true,
+  };
+}
+
+/**
+ * Reads the dashboard. `full` walks every donation since the subathon start and
+ * is what makes a restart or a long outage safe; otherwise it continues after
+ * the last sequence number seen.
+ */
+function sync(runtime, reason, full) {
   if (runtime.stopped || !runtime.config.enabled) {
     return Promise.resolve({ ok: false, fetched: 0, emitted: 0, error: "plugin desativado" });
   }
-  if (runtime.pollPromise) return Promise.resolve({ ok: true, fetched: 0, emitted: 0, skipped: true });
-  runtime.pollPromise = runPoll(runtime, reason).finally(() => { runtime.pollPromise = null; });
-  return runtime.pollPromise;
+  if (runtime.syncPromise) {
+    if (full) runtime.fullSyncQueued = true;
+    return runtime.syncPromise;
+  }
+  runtime.syncPromise = runSync(runtime, reason, full).finally(() => {
+    runtime.syncPromise = null;
+    if (runtime.fullSyncQueued && !runtime.stopped) {
+      runtime.fullSyncQueued = false;
+      void sync(runtime, reason, true);
+    }
+  });
+  return runtime.syncPromise;
 }
 
-async function runPoll(runtime, reason) {
+async function runSync(runtime, reason, full) {
   let fetched = 0;
   let emitted = 0;
   try {
-    const baseline = runtime.state.forceBaseline
-      || (!runtime.state.initialized && !runtime.config.processExisting);
-    const payments = await fetchResource(runtime, "payments", baseline);
-    const messages = runtime.config.readMessages
-      ? await fetchResource(runtime, "messages", baseline)
-      : [];
-    const donations = mergeDonations(payments, messages);
-    fetched = donations.length;
-
-    const pending = [];
-    for (const donation of donations) {
-      const key = "livepix:" + donationKey(donation);
-      if (runtime.seenSet.has(key)) continue;
-      markSeen(runtime, key);
-      if (baseline || !isValidItem(runtime, donation)) continue;
-      pending.push(donation);
+    const since = new Date(startAtMs(runtime)).toISOString();
+    let after = full ? "0" : runtime.state.lastSeq;
+    for (let page = 0; page < MAX_PAGES_PER_SYNC; page += 1) {
+      const result = await fetchPage(runtime, since, after);
+      fetched += result.donations.length;
+      emitted += await accept(runtime, result.donations);
+      if (!result.hasMore || !result.nextAfter || result.nextAfter === after) break;
+      after = result.nextAfter;
     }
-    pending.sort((a, b) => Date.parse(a.createdAt || 0) - Date.parse(b.createdAt || 0));
-    runtime.state.initialized = true;
-    runtime.state.forceBaseline = false;
-    runtime.state.lastPollAt = new Date().toISOString();
-    runtime.lastError = "";
-    runtime.connected = true;
-    runtime.backoffMs = 0;
+    runtime.state.lastSyncAt = new Date().toISOString();
+    if (full) runtime.lastFullSyncAt = Date.now();
+    runtime.apiError = "";
+    runtime.lastSyncOk = true;
     await persist(runtime);
-    runtime.controller.signal.throwIfAborted();
-    for (const donation of pending) {
-      runtime.ctx.emitTrigger("donation", buildPayload(runtime, donation));
-      emitted += 1;
-      runtime.emittedSinceStart += 1;
-    }
-    if (baseline) {
-      runtime.ctx.log.info(
-        "primeira consulta: " + String(fetched) + " doação(ões) do histórico marcadas como vistas, nenhum gatilho disparado",
-      );
-    } else if (emitted > 0) {
-      runtime.ctx.log.info(String(emitted) + " gatilho(s) disparado(s) (" + reason + ")");
-    }
+    if (emitted > 0) runtime.ctx.log.info(String(emitted) + " gatilho(s) disparado(s) pela API (" + reason + ")");
     publishStatus(runtime);
     return { ok: true, fetched, emitted };
   } catch (error) {
     if (runtime.stopped) return { ok: false, fetched, emitted, error: "consulta cancelada" };
-    runtime.lastError = describe(error);
-    runtime.connected = false;
-    if (error instanceof RateLimitedError) {
-      runtime.backoffMs = Math.min(
-        MAX_BACKOFF_MS,
-        Math.max(runtime.config.pollSeconds * 1000 * 2, runtime.backoffMs * 2),
-      );
-    }
-    runtime.ctx.log.warn("consulta falhou: " + runtime.lastError);
+    runtime.apiError = describe(error);
+    runtime.lastSyncOk = false;
+    runtime.ctx.log.warn("consulta ao dashboard falhou: " + runtime.apiError);
     publishStatus(runtime);
-    return { ok: false, fetched, emitted, error: runtime.lastError };
+    return { ok: false, fetched, emitted, error: runtime.apiError };
   }
+}
+
+function scheduleSync(runtime, delayMs) {
+  if (runtime.stopped) return;
+  if (runtime.syncTimer) clearTimeout(runtime.syncTimer);
+  const delay = delayMs ?? (runtime.socketOpen ? RECONCILE_MS : runtime.config.pollSeconds * 1000);
+  runtime.syncTimer = setTimeout(() => {
+    runtime.syncTimer = null;
+    // Between full passes only what came after the cursor is read. A full pass from the
+    // subathon start runs every few minutes whatever the transport, and catches anything the
+    // cursor could have stepped over.
+    const full = Date.now() - runtime.lastFullSyncAt >= RECONCILE_MS;
+    void sync(runtime, runtime.socketOpen ? "verificação periódica" : "fallback", full)
+      .finally(() => scheduleSync(runtime));
+  }, delay);
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket (RFC 6455 client over node:http, since Node 20 has no global WebSocket)
+// ---------------------------------------------------------------------------
+
+function encodeFrame(opcode, payload) {
+  const data = Buffer.isBuffer(payload) ? payload : Buffer.from(payload ?? "", "utf8");
+  const mask = randomBytes(4);
+  let header;
+  if (data.length < 126) {
+    header = Buffer.alloc(2);
+    header[1] = 0x80 | data.length;
+  } else if (data.length < 65536) {
+    header = Buffer.alloc(4);
+    header[1] = 0x80 | 126;
+    header.writeUInt16BE(data.length, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[1] = 0x80 | 127;
+    header.writeBigUInt64BE(BigInt(data.length), 2);
+  }
+  header[0] = 0x80 | opcode;
+  const masked = Buffer.alloc(data.length);
+  for (let i = 0; i < data.length; i += 1) masked[i] = data[i] ^ mask[i % 4];
+  return Buffer.concat([header, mask, masked]);
+}
+
+/**
+ * Opens a client socket. Calls `onMessage(text)` per text message and `onClose(code, reason)`
+ * exactly once, whether the handshake failed (401 → 4001, 403 → 4003, else 1006) or the
+ * connection ended.
+ */
+export function connectWebSocket(target, headers, { onOpen, onMessage, onClose }) {
+  const url = new URL(target);
+  const secure = url.protocol === "wss:" || url.protocol === "https:";
+  const key = randomBytes(16).toString("base64");
+  let socket = null;
+  let closed = false;
+  let buffer = Buffer.alloc(0);
+  let fragments = [];
+
+  function finish(code, reason) {
+    if (closed) return;
+    closed = true;
+    try {
+      socket?.destroy();
+    } catch {
+      // Already gone.
+    }
+    onClose(code, reason);
+  }
+
+  const request = (secure ? https : http).request({
+    hostname: url.hostname.replace(/^\[|\]$/g, ""),
+    port: url.port || (secure ? 443 : 80),
+    path: url.pathname + url.search,
+    headers: {
+      ...headers,
+      connection: "Upgrade",
+      upgrade: "websocket",
+      "sec-websocket-version": "13",
+      "sec-websocket-key": key,
+    },
+    timeout: REQUEST_TIMEOUT_MS,
+  });
+  request.on("timeout", () => request.destroy(new Error("tempo esgotado ao conectar")));
+  request.on("error", (error) => finish(1006, describe(error)));
+  request.on("response", (response) => {
+    response.resume();
+    const status = response.statusCode ?? 0;
+    finish(status === 401 ? 4001 : status === 403 ? 4003 : 1006, "HTTP " + String(status));
+  });
+  request.on("upgrade", (response, upgraded, head) => {
+    socket = upgraded;
+    const expected = createHash("sha1").update(key + WS_GUID).digest("base64");
+    if (response.headers["sec-websocket-accept"] !== expected) {
+      finish(1006, "handshake inválido");
+      return;
+    }
+    socket.setNoDelay(true);
+    socket.on("data", (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      parse();
+    });
+    socket.on("close", () => finish(1006, "conexão encerrada"));
+    socket.on("error", (error) => finish(1006, describe(error)));
+    onOpen?.();
+    if (head && head.length > 0) {
+      buffer = Buffer.concat([buffer, head]);
+      parse();
+    }
+  });
+  request.end();
+
+  function parse() {
+    while (!closed && buffer.length >= 2) {
+      const fin = (buffer[0] & 0x80) !== 0;
+      const opcode = buffer[0] & 0x0f;
+      let length = buffer[1] & 0x7f;
+      let offset = 2;
+      if (length === 126) {
+        if (buffer.length < 4) return;
+        length = buffer.readUInt16BE(2);
+        offset = 4;
+      } else if (length === 127) {
+        if (buffer.length < 10) return;
+        length = Number(buffer.readBigUInt64BE(2));
+        offset = 10;
+      }
+      // Servers never mask; a masked frame is a protocol error, but the length math still holds.
+      const masked = (buffer[1] & 0x80) !== 0;
+      const maskOffset = offset;
+      if (masked) offset += 4;
+      if (buffer.length < offset + length) return;
+      let payload = buffer.subarray(offset, offset + length);
+      if (masked) {
+        const mask = buffer.subarray(maskOffset, maskOffset + 4);
+        payload = Buffer.from(payload.map((byte, i) => byte ^ mask[i % 4]));
+      }
+      buffer = buffer.subarray(offset + length);
+      if (opcode === 0x8) {
+        const code = payload.length >= 2 ? payload.readUInt16BE(0) : 1005;
+        const reason = payload.subarray(2).toString("utf8");
+        try {
+          socket.write(encodeFrame(0x8, payload.subarray(0, 2)));
+        } catch {
+          // The peer may already be gone.
+        }
+        finish(code, reason);
+        return;
+      }
+      if (opcode === 0x9) {
+        socket.write(encodeFrame(0xa, payload));
+        continue;
+      }
+      if (opcode === 0xa) continue;
+      if (opcode === 0x1 || opcode === 0x0) {
+        fragments.push(payload);
+        if (fin) {
+          const text = Buffer.concat(fragments).toString("utf8");
+          fragments = [];
+          onMessage(text);
+        }
+      }
+    }
+  }
+
+  return {
+    send(text) {
+      if (!closed && socket) socket.write(encodeFrame(0x1, text));
+    },
+    close(code = 1000) {
+      if (closed) return;
+      if (socket) {
+        const payload = Buffer.alloc(2);
+        payload.writeUInt16BE(code, 0);
+        try {
+          socket.write(encodeFrame(0x8, payload));
+        } catch {
+          // Closing anyway.
+        }
+      } else {
+        request.destroy();
+      }
+      finish(code, "encerrado pelo plugin");
+    },
+  };
+}
+
+function websocketUrl(runtime) {
+  return runtime.config.baseUrl.replace(/^http/, "ws") + "/" + runtime.config.webhookId + "/websocket";
+}
+
+function openSocket(runtime) {
+  if (runtime.stopped || runtime.socket) return;
+  runtime.socket = connectWebSocket(websocketUrl(runtime), { authorization: "Bearer " + runtime.config.apiToken }, {
+    onOpen() {
+      runtime.socketOpen = true;
+      runtime.reconnectMs = 0;
+      runtime.socketError = "";
+      armSilenceTimer(runtime);
+      publishStatus(runtime);
+      // Whatever arrived while the socket was down is read now, from the subathon start.
+      void sync(runtime, "reconexão", true).finally(() => scheduleSync(runtime));
+    },
+    onMessage(text) {
+      armSilenceTimer(runtime);
+      let message;
+      try {
+        message = JSON.parse(text);
+      } catch {
+        return;
+      }
+      if (message && message.type === "donation" && message.donation) {
+        void accept(runtime, [message.donation]).then((emitted) => {
+          if (emitted > 0) runtime.ctx.log.info("doação recebida em tempo real");
+          publishStatus(runtime);
+        });
+      }
+    },
+    onClose(code, reason) {
+      const wasOpen = runtime.socketOpen;
+      runtime.socket = null;
+      runtime.socketOpen = false;
+      if (runtime.silenceTimer) clearTimeout(runtime.silenceTimer);
+      runtime.silenceTimer = null;
+      if (runtime.stopped) return;
+      runtime.socketError = code === 4001
+        ? "token recusado"
+        : code === 4003
+          ? "webhook inativo"
+          : code === 4004
+            ? "webhook removido"
+            : reason;
+      if (wasOpen) runtime.ctx.log.warn("WebSocket desconectado (" + runtime.socketError + "); usando a API até reconectar");
+      publishStatus(runtime);
+      // The API takes over at the configured interval until the socket is back.
+      scheduleSync(runtime, runtime.config.pollSeconds * 1000);
+      const auth = code === 4001 || code === 4003 || code === 4004;
+      runtime.reconnectMs = auth
+        ? MAX_RECONNECT_MS
+        : Math.min(MAX_RECONNECT_MS, Math.max(1000, runtime.reconnectMs * 2));
+      runtime.reconnectTimer = setTimeout(() => {
+        runtime.reconnectTimer = null;
+        openSocket(runtime);
+      }, runtime.reconnectMs);
+    },
+  });
+}
+
+function armSilenceTimer(runtime) {
+  if (runtime.silenceTimer) clearTimeout(runtime.silenceTimer);
+  runtime.silenceTimer = setTimeout(() => {
+    runtime.silenceTimer = null;
+    runtime.socket?.close(4000);
+  }, SOCKET_SILENCE_MS);
+}
+
+// ---------------------------------------------------------------------------
+// Status
+// ---------------------------------------------------------------------------
+
+function clock(iso) {
+  const at = iso ? new Date(iso) : null;
+  return at && !Number.isNaN(at.getTime()) ? at.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" }) : "";
+}
+
+function transport(runtime) {
+  if (runtime.socketOpen) return "websocket";
+  if (runtime.lastSyncOk) return "polling";
+  return "offline";
 }
 
 function publishStatus(runtime) {
   if (runtime.stopped) return;
-  if (!runtime.config.clientId || !runtime.config.clientSecret) {
+  const problem = configProblem(runtime.config);
+  if (problem) {
+    runtime.ctx.setStatus({ health: "degraded", connectionState: "aguardando configuração", errors: [problem] });
+    return;
+  }
+  const mode = transport(runtime);
+  if (mode === "websocket") {
+    runtime.ctx.setStatus({ health: "healthy", connectionState: "tempo real (WebSocket)" });
+    return;
+  }
+  if (mode === "polling") {
+    const at = clock(runtime.state.lastSyncAt);
     runtime.ctx.setStatus({
       health: "degraded",
-      connectionState: "aguardando credenciais",
-      errors: ["Informe o Client ID e o Client Secret na aba Credenciais."],
+      connectionState: "consultando a API a cada " + String(runtime.config.pollSeconds) + " s" + (at ? "; última " + at : ""),
+      errors: ["WebSocket indisponível" + (runtime.socketError ? " (" + runtime.socketError + ")" : "")],
     });
     return;
   }
-  if (runtime.connected) {
-    const at = runtime.state.lastPollAt ? new Date(runtime.state.lastPollAt) : null;
-    const clock = at && !Number.isNaN(at.getTime())
-      ? at.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })
-      : "";
-    runtime.ctx.setStatus({
-      health: "healthy",
-      connectionState: clock ? "conectado; última consulta " + clock : "conectado",
-    });
-    return;
-  }
+  const errors = [runtime.apiError, runtime.socketError && "WebSocket: " + runtime.socketError].filter(Boolean);
   runtime.ctx.setStatus({
-    health: runtime.lastError ? "degraded" : "unknown",
-    connectionState: runtime.lastError ? "com erro" : "conectando",
-    ...(runtime.lastError ? { errors: [runtime.lastError] } : {}),
+    health: errors.length > 0 ? "degraded" : "unknown",
+    connectionState: errors.length > 0 ? "com erro" : "conectando",
+    ...(errors.length > 0 ? { errors } : {}),
   });
-}
-
-function schedule(runtime) {
-  if (runtime.stopped) return;
-  const delay = runtime.backoffMs > 0 ? runtime.backoffMs : runtime.config.pollSeconds * 1000;
-  runtime.timer = setTimeout(() => {
-    runtime.timer = null;
-    void poll(runtime, "intervalo").finally(() => schedule(runtime));
-  }, delay);
 }
 
 function statusSnapshot(runtime) {
   return {
-    connected: runtime.connected,
-    lastPollAt: runtime.state.lastPollAt,
-    lastError: runtime.lastError,
-    seen: runtime.state.seen.length,
+    connected: runtime.socketOpen || runtime.lastSyncOk,
+    transport: transport(runtime),
+    lastPollAt: runtime.state.lastSyncAt,
+    lastError: runtime.apiError || runtime.socketError,
+    seen: runtime.processed.size,
     emittedSinceStart: runtime.emittedSinceStart,
+    startAt: new Date(startAtMs(runtime)).toISOString(),
   };
 }
 
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
 function stopRuntime(runtime) {
   runtime.stopped = true;
-  runtime.connected = false;
-  if (runtime.timer) clearTimeout(runtime.timer);
-  runtime.timer = null;
+  runtime.socketOpen = false;
+  for (const timer of ["syncTimer", "reconnectTimer", "silenceTimer"]) {
+    if (runtime[timer]) clearTimeout(runtime[timer]);
+    runtime[timer] = null;
+  }
+  runtime.socket?.close(1001);
+  runtime.socket = null;
   runtime.controller.abort();
 }
 
@@ -401,26 +713,33 @@ export default {
       ctx,
       config,
       state,
-      seenSet: new Set(state.seen),
-      token: null,
-      timer: null,
-      pollPromise: null,
+      processed: new Map(state.processed),
       controller: new AbortController(),
       stopped: false,
-      backoffMs: 0,
-      connected: false,
-      lastError: "",
+      socket: null,
+      socketOpen: false,
+      socketError: "",
+      apiError: "",
+      lastSyncOk: false,
+      syncPromise: null,
+      fullSyncQueued: false,
+      lastFullSyncAt: 0,
+      inFlight: new Set(),
+      syncTimer: null,
+      reconnectTimer: null,
+      silenceTimer: null,
+      reconnectMs: 0,
       emittedSinceStart: 0,
     };
     activeRuntime = runtime;
     runtime.onAbort = () => stopRuntime(runtime);
     ctx.signal?.addEventListener("abort", runtime.onAbort, { once: true });
     if (ctx.signal?.aborted) stopRuntime(runtime);
+
     ctx.registerAction("poll-now", async () => {
-      if (!config.clientId || !config.clientSecret) {
-        return { ok: false, fetched: 0, emitted: 0, error: "credenciais ausentes" };
-      }
-      return poll(runtime, "ação");
+      const problem = configProblem(runtime.config);
+      if (problem) return { ok: false, fetched: 0, emitted: 0, error: problem };
+      return sync(runtime, "ação", true);
     });
     ctx.registerAction("status", async () => statusSnapshot(runtime));
 
@@ -429,12 +748,22 @@ export default {
       ctx.setStatus({ health: "healthy", connectionState: "desativado" });
       return;
     }
-    publishStatus(runtime);
-    if (!config.clientId || !config.clientSecret) {
-      ctx.log.warn("LivePix ativado sem Client ID ou Client Secret; nada será consultado");
+    const problem = configProblem(config);
+    if (problem) {
+      publishStatus(runtime);
+      ctx.log.warn("LivePix não iniciado: " + problem);
       return;
     }
-    void poll(runtime, "ativação").finally(() => schedule(runtime));
+    if (!Number.isFinite(config.startAtMs) && !state.autoStartAt) {
+      // No subathon start configured: count from now on, never the history.
+      state.autoStartAt = Date.now();
+      ctx.log.info("sem início do subathon configurado; contando doações a partir de agora");
+    }
+    pruneProcessed(runtime);
+    await persist(runtime);
+    publishStatus(runtime);
+    openSocket(runtime);
+    void sync(runtime, "ativação", true).finally(() => scheduleSync(runtime));
   },
 
   async deactivate() {
@@ -442,8 +771,8 @@ export default {
     if (!runtime) return;
     stopRuntime(runtime);
     runtime.ctx.signal?.removeEventListener("abort", runtime.onAbort);
-    await runtime.pollPromise;
-    runtime.token = null;
+    await runtime.syncPromise;
+    await Promise.allSettled([...runtime.inFlight]);
     await persist(runtime);
     activeRuntime = null;
   },

@@ -1,0 +1,199 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../server/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Better Auth: email and password accounts, sessions and the API key plugin.
+// Field names follow what the Better Auth Prisma adapter reads and writes.
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id
+  name          String
+  email         String    @unique
+  emailVerified Boolean   @default(false)
+  image         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  sessions      Session[]
+  accounts      Account[]
+  webhooks      Webhook[]
+
+  @@map("user")
+}
+
+model Session {
+  id        String   @id
+  expiresAt DateTime
+  token     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  ipAddress String?
+  userAgent String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("session")
+}
+
+model Account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([userId])
+  @@map("account")
+}
+
+model Verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+  @@map("verification")
+}
+
+/// Owned by the Better Auth API key plugin. One key per webhook, referenced by Webhook.apiKeyId.
+model Apikey {
+  id                  String    @id
+  configId            String    @default("default")
+  name                String?
+  start               String?
+  referenceId         String
+  prefix              String?
+  key                 String
+  refillInterval      Int?
+  refillAmount        Int?
+  lastRefillAt        DateTime?
+  enabled             Boolean?  @default(true)
+  rateLimitEnabled    Boolean?  @default(true)
+  rateLimitTimeWindow Int?
+  rateLimitMax        Int?
+  requestCount        Int?      @default(0)
+  remaining           Int?
+  lastRequest         DateTime?
+  expiresAt           DateTime?
+  createdAt           DateTime
+  updatedAt           DateTime
+  permissions         String?
+  metadata            String?
+
+  @@index([configId])
+  @@index([referenceId])
+  @@index([key])
+  @@map("apikey")
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard domain.
+// ---------------------------------------------------------------------------
+
+/// One LivePix webhook entry. The id is the secret part of every public URL.
+model Webhook {
+  id                     String     @id
+  userId                 String
+  user                   User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name                   String
+  active                 Boolean    @default(true)
+  /// LivePix OAuth app used to read the donation behind each notification.
+  livepixClientId        String?
+  /// AES-256-GCM ciphertext; never leaves the server.
+  livepixClientSecretEnc String?
+  apiKeyId               String?
+  apiKeyStart            String?
+  apiKeyCreatedAt        DateTime?
+  createdAt              DateTime   @default(now())
+  updatedAt              DateTime   @updatedAt
+  deliveries             Delivery[]
+  donations              Donation[]
+
+  @@index([userId])
+  @@map("webhook")
+}
+
+enum DeliveryStatus {
+  pending
+  processed
+  duplicate
+  ignored
+  failed
+}
+
+/// Every request LivePix sends, stored raw before anything else happens.
+model Delivery {
+  id            String         @id @default(cuid())
+  webhookId     String
+  webhook       Webhook        @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+  receivedAt    DateTime       @default(now())
+  method        String
+  path          String
+  query         String
+  headers       Json
+  body          String
+  remoteIp      String?
+  event         String?
+  resourceType  String?
+  resourceId    String?
+  status        DeliveryStatus @default(pending)
+  attempts      Int            @default(0)
+  lastError     String?
+  /// Null means no automatic retry; the user can still reprocess it.
+  nextAttemptAt DateTime?      @default(now())
+  lockedUntil   DateTime?
+  processedAt   DateTime?
+  donationId    String?
+  donation      Donation?      @relation(fields: [donationId], references: [id], onDelete: SetNull)
+
+  @@index([webhookId, receivedAt])
+  @@index([status, nextAttemptAt])
+  @@map("delivery")
+}
+
+/// One donation, however many notifications LivePix sent for it.
+model Donation {
+  id         String     @id @default(cuid())
+  /// Monotonic cursor for the plugin API.
+  seq        BigInt     @unique @default(autoincrement())
+  webhookId  String
+  webhook    Webhook    @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+  /// LivePix proof, else reference, else id. The plugin deduplicates on it.
+  key        String
+  occurredAt DateTime
+  receivedAt DateTime   @default(now())
+  amount     Int
+  currency   String
+  username   String     @default("")
+  message    String     @default("")
+  flagged    Boolean    @default(false)
+  livepixId  String     @default("")
+  proof      String     @default("")
+  reference  String     @default("")
+  source     String
+  raw        Json
+  deliveries Delivery[]
+
+  @@unique([webhookId, key])
+  @@index([webhookId, occurredAt])
+  @@map("donation")
+}

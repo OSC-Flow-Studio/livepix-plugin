@@ -1,9 +1,9 @@
 {
   "name": "livepix-plugin",
-  "version": "1.2.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "Plugin LivePix para o gerenciador de pacotes do OSC Flow Studio 0.5.0",
+  "description": "Plugin LivePix para o OSC Flow Studio 0.5.0, conectado ao OSC LivePix Dashboard",
   "repository": { "type": "git", "url": "https://github.com/OSC-Flow-Studio/livepix-plugin.git" },
   "engines": { "node": ">=22" },
   "scripts": {
@@ -14,5 +14,5 @@
     "package": "node sdk/ofs-package.mjs pack plugin --out dist",
     "catalog": "node scripts/build-catalog.mjs"
   },
-  "devDependencies": { "ajv": "8.17.1", "ajv-formats": "3.0.1" }
+  "devDependencies": { "ajv": "8.17.1", "ajv-formats": "3.0.1", "ws": "8.21.3" }
 }

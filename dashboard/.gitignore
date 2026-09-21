@@ -1,0 +1,8 @@
+node_modules/
+dist/
+server/generated/
+.env
+.env.*
+!.env.example
+*.log
+.pglite/
