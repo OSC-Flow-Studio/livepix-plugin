@@ -113,6 +113,17 @@ export function publicRoutes(deps: PublicDeps) {
   app.use("/:id/api", async (c, next) => (await authorize(c)) ?? next());
   app.use("/:id/api/*", async (c, next) => (await authorize(c)) ?? next());
 
+  app.post("/:id/api/accounted", async (c) => {
+    const parsed = z.object({ eventKey: z.string().startsWith("livepix:donation:").max(1000) }).safeParse(await c.req.json().catch(() => null));
+    if (!parsed.success) return c.json({ error: "invalid_body" }, 400);
+    const key = parsed.data.eventKey.slice("livepix:donation:".length);
+    const donation = await db.donation.findUnique({ where: { webhookId_key: { webhookId: c.get("webhook").id, key } } });
+    if (!donation) return c.json({ error: "not_found" }, 404);
+    // Preserve the first receipt when an already-counted donation is retried.
+    await db.donation.updateMany({ where: { id: donation.id, accountedAt: null }, data: { accountedAt: new Date() } });
+    return c.json({ ok: true });
+  });
+
   app.get("/:id/api", async (c) => {
     const webhook = c.get("webhook");
     return c.json({

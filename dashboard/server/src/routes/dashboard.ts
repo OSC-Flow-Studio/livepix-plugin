@@ -265,9 +265,14 @@ export function dashboardRoutes(deps: DashboardDeps) {
   app.get("/webhooks/:id/donations", async (c) => {
     const webhook = await owned(c.get("user").id, c.req.param("id"));
     if (!webhook) return c.json({ error: "not_found" }, 404);
-    const page = pageSchema.parse(c.req.query());
+    const parsed = pageSchema.extend({ since: z.iso.datetime({ offset: true }).optional(), search: z.string().max(200).optional() }).safeParse(c.req.query());
+    if (!parsed.success) return c.json({ error: "invalid_query" }, 400);
+    const page = parsed.data;
     const rows = await db.donation.findMany({
-      where: { webhookId: webhook.id },
+      where: { webhookId: webhook.id,
+        ...(page.since ? { occurredAt: { gte: new Date(page.since) } } : {}),
+        ...(page.search ? { OR: ["key", "livepixId", "reference", "username", "message"].map((field) => ({ [field]: { contains: page.search, mode: "insensitive" as const } })) } : {}),
+      },
       orderBy: { seq: "desc" },
       take: page.limit + 1,
       ...(page.cursor ? { cursor: { id: page.cursor }, skip: 1 } : {}),
@@ -275,9 +280,44 @@ export function dashboardRoutes(deps: DashboardDeps) {
     const hasMore = rows.length > page.limit;
     const items = rows.slice(0, page.limit);
     return c.json({
-      donations: items.map((row) => ({ ...toPluginDonation(row), rowId: row.id })),
+      donations: items.map((row) => ({ ...toPluginDonation(row), rowId: row.id, accountedAt: row.accountedAt?.toISOString() ?? null,
+        lastResentAt: row.lastResentAt?.toISOString() ?? null, resendCount: row.resendCount })),
       nextCursor: hasMore ? items[items.length - 1]!.id : null,
     });
+  });
+
+  app.post("/webhooks/:id/donations/import", async (c) => {
+    const webhook = await owned(c.get("user").id, c.req.param("id"));
+    if (!webhook) return c.json({ error: "not_found" }, 404);
+    if (!webhook.active) return c.json({ error: "webhook_inactive" }, 409);
+    const parsed = z.object({ since: z.iso.datetime({ offset: true }), resource: z.enum(["messages", "payments"]), page: z.number().int().min(1).max(1_000_000) }).safeParse(await c.req.json().catch(() => null));
+    if (!parsed.success) return c.json({ error: "invalid_body" }, 400);
+    try {
+      return c.json(await processor.importPage(webhook, new Date(parsed.data.since), parsed.data.resource, parsed.data.page));
+    } catch {
+      return c.json({ error: "history_unavailable" }, 502);
+    }
+  });
+
+  app.post("/webhooks/:id/donations/:donationId/resend", async (c) => {
+    const webhook = await owned(c.get("user").id, c.req.param("id"));
+    if (!webhook) return c.json({ error: "not_found" }, 404);
+    if (!webhook.active) return c.json({ error: "webhook_inactive" }, 409);
+    const donation = await db.donation.findFirst({ where: { id: c.req.param("donationId"), webhookId: webhook.id } });
+    if (!donation) return c.json({ error: "not_found" }, 404);
+    const sent = hub.publish(webhook.id, { type: "donation.replay", requestId: randomId(), donation: toPluginDonation(donation) });
+    if (!sent) return c.json({ error: "plugin_offline" }, 409);
+    await db.donation.update({ where: { id: donation.id }, data: { lastResentAt: new Date(), resendCount: { increment: 1 } } });
+    return c.json({ ok: true, sent });
+  });
+
+  app.post("/webhooks/:id/donations/recover", async (c) => {
+    const webhook = await owned(c.get("user").id, c.req.param("id"));
+    if (!webhook) return c.json({ error: "not_found" }, 404);
+    if (!webhook.active) return c.json({ error: "webhook_inactive" }, 409);
+    const sent = hub.publish(webhook.id, { type: "donations.recover", requestId: randomId() });
+    if (!sent) return c.json({ error: "plugin_offline" }, 409);
+    return c.json({ ok: true, sent });
   });
 
   return app;

@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { existsSync } from "node:fs";
 import { Browser, openSocket, startHarness, until, type Harness } from "./harness.js";
 
 let h: Harness;
@@ -16,6 +17,7 @@ beforeEach(() => {
   h.livepix.payments.clear();
   h.livepix.failWith = null;
   h.livepix.calls = [];
+  h.livepix.pages = [];
 });
 
 interface Setup {
@@ -63,6 +65,171 @@ async function pluginGet(s: Setup, path: string, token = s.token) {
   const response = await fetch(`${s.urls.apiUrl}${path}`, { headers: { authorization: "Bearer " + token } });
   return { status: response.status, body: await response.json() };
 }
+
+describe("donation recovery", () => {
+  const since = "2026-09-21T12:00:00.000Z";
+  const importPage = (s: Setup, page: number, resource = "messages", start = since) => s.browser.request(`/api/webhooks/${s.id}/donations/import`, {
+    method: "POST", body: { since: start, resource, page },
+  });
+
+  // Cross-repository contract coverage runs when the Studio build and Subathon checkout are available.
+  it.skipIf(!existsSync(new URL("../../../osc-flow-studio/packages/flow-engine/dist/index.js", import.meta.url)) ||
+    !existsSync(new URL("../../../catopanda-subathon/plugin/index.mjs", import.meta.url)))
+  ("recovers a failed real flow through dashboard WebSocket and confirms only committed accounting", async () => {
+    const [{ default: livepix }, { default: subathon }, { context }, { FlowEngine }, { readFile }] = await Promise.all([
+      import(new URL("../../plugin/index.mjs", import.meta.url).href),
+      import(new URL("../../../catopanda-subathon/plugin/index.mjs", import.meta.url).href),
+      import(new URL("../../tests/helpers/dashboard.mjs", import.meta.url).href),
+      import(new URL("../../../osc-flow-studio/packages/flow-engine/dist/index.js", import.meta.url).href),
+      import("node:fs/promises"),
+    ]);
+    const s = await setup();
+    const source = context({ baseUrl: h.base, apiToken: s.token, startAt: since });
+    const target = context({ port: 0, initialTimerSeconds: 3600, donateSecondsPerReal: 60, warningThresholds: [] });
+    const manifest = JSON.parse(await readFile(new URL("../../../catopanda-subathon/plugin/manifest.json", import.meta.url), "utf8"));
+    const flow = manifest.templates.find((entry: { id: string }) => entry.id === "catopanda-subathon-livepix").flow;
+    let failAccounting = true;
+    const executions: Array<Promise<{ errors: unknown[] }>> = [];
+    source.ctx.emitTrigger = (_kind: string, metadata: Record<string, unknown>) => {
+      executions.push(new FlowEngine().execute({ ...structuredClone(flow), enabled: true }, {
+        osc: {}, variables: {}, nodeOutputStore: {}, entryNodeId: "livepix-donation", triggerNodeId: "livepix-donation",
+        pluginConfigs: { livepix: { enabled: true }, "catopanda-subathon": { enabled: true } },
+        trigger: { integration: "livepix", kind: "donation", triggeredAt: new Date().toISOString(), metadata },
+        executePluginAction: async ({ nodeType, data }: { nodeType: string; data: Record<string, unknown> }) => {
+          const parts = nodeType.split(".");
+          if (parts[2] === "catopanda-subathon" && failAccounting) throw new Error("Test flow failure");
+          return (parts[2] === "livepix" ? source : target).actions.get(parts[3])(data);
+        },
+      }));
+    };
+    try {
+      await subathon.activate(target.ctx);
+      h.livepix.messages.set("lost", message("lost", "LOST", { amount: 500 }));
+      h.livepix.messages.set("before-start", message("before-start", "BEFORE", { createdAt: "2026-09-20T12:00:00Z" }));
+      await importPage(s, 1, "messages", "2026-09-20T00:00:00Z");
+      await livepix.activate(source.ctx);
+      await source.actions.get("poll-now")({});
+      await until(() => executions.length === 1 && h.hub.count(s.id) === 1);
+      expect((await executions[0]!).errors.length).toBeGreaterThan(0);
+      const donation = await h.db.donation.findUniqueOrThrow({ where: { webhookId_key: { webhookId: s.id, key: "LOST" } } });
+      expect(donation.accountedAt).toBeNull();
+      expect((await target.actions.get("get-state")({})).totals.donate).toBe(0);
+      failAccounting = false;
+      const replay = () => s.browser.request(`/api/webhooks/${s.id}/donations/${donation.id}/resend`, { method: "POST" });
+      expect((await replay()).status).toBe(200);
+      await until(() => executions.length === 2);
+      expect((await executions[1]!).errors).toEqual([]);
+      expect((await h.db.donation.findUniqueOrThrow({ where: { id: donation.id } })).accountedAt).not.toBeNull();
+      const recover = await s.browser.request(`/api/webhooks/${s.id}/donations/recover`, { method: "POST" });
+      expect(recover.status).toBe(200);
+      await until(() => executions.length === 3);
+      expect((await executions[2]!).errors).toEqual([]);
+      const state = await target.actions.get("get-state")({});
+      expect(state.totals.donate).toBe(500);
+      expect(state.totals.addedSeconds).toBe(300);
+      expect(state.timer.remainingSeconds).toBe(3900);
+      const before = await h.db.donation.findUniqueOrThrow({ where: { webhookId_key: { webhookId: s.id, key: "BEFORE" } } });
+      expect(before.accountedAt).toBeNull();
+    } finally { await livepix.deactivate(); await Promise.allSettled(executions); await subathon.deactivate(); }
+  });
+
+  it("imports all pages without a webhook and preserves dates and payment/message identity", async () => {
+    const s = await setup();
+    for (let i = 0; i < 103; i++) h.livepix.messages.set(`history-${i}`, message(`history-${i}`, `H${i}`, { createdAt: since }));
+    h.livepix.messages.set("old", message("old", "OLD", { createdAt: "2026-09-21T11:59:59.999Z" }));
+    h.livepix.messages.set("invalid", message("invalid", "INVALID", { createdAt: undefined }));
+    const first = await importPage(s, 1);
+    expect(first.status).toBe(200);
+    expect(first.body).toMatchObject({ fetched: 100, imported: 98, excluded: 1, invalid: 1, hasMore: true });
+    expect((await importPage(s, 2)).body).toMatchObject({ fetched: 5, imported: 5, hasMore: true });
+    expect((await importPage(s, 3)).body).toMatchObject({ fetched: 0, hasMore: false });
+    expect(h.livepix.pages).toEqual([1, 2, 3].map((page) => ({ resource: "messages", page, limit: 100 })));
+    expect(await h.db.donation.count({ where: { webhookId: s.id } })).toBe(103);
+    expect(await h.db.delivery.count({ where: { webhookId: s.id } })).toBe(0);
+    h.livepix.payments.set("p1", message("p1", "H1", { createdAt: since }));
+    expect((await importPage(s, 1, "payments")).body).toMatchObject({ imported: 0, existing: 1 });
+    expect((await importPage(s, 1)).body).toMatchObject({ imported: 0, existing: 98 });
+    const search = await s.browser.request(`/api/webhooks/${s.id}/donations?search=H102&since=${since}`);
+    expect(search.body.donations).toHaveLength(1);
+    expect(search.body.donations[0]).toMatchObject({ id: "H102", accountedAt: null, resendCount: 0 });
+  });
+
+  it("retains imported pages across a provider failure and rejects invalid date requests", async () => {
+    const s = await setup();
+    h.livepix.messages.set("kept", message("kept", "KEPT"));
+    expect((await importPage(s, 1)).body.imported).toBe(1);
+    h.livepix.failWith = 503;
+    expect((await importPage(s, 2)).status).toBe(502);
+    expect(await h.db.donation.count({ where: { webhookId: s.id } })).toBe(1);
+    h.livepix.failWith = null;
+    expect((await importPage(s, 1)).body.existing).toBe(1);
+    expect((await importPage(s, 0)).status).toBe(400);
+    expect((await importPage(s, 1, "messages", "not-a-date")).status).toBe(400);
+    expect((await importPage(s, 1, "messages", "2026-02-30T00:00:00Z")).status).toBe(400);
+  });
+
+  it("resends the original donation with a new request ID and never treats transport as accounting", async () => {
+    const s = await setup();
+    h.livepix.messages.set("retry", message("retry", "RETRY"));
+    await importPage(s, 1);
+    const row = await h.db.donation.findFirstOrThrow({ where: { webhookId: s.id } });
+    const url = `/api/webhooks/${s.id}/donations/${row.id}/resend`;
+    expect((await s.browser.request(url, { method: "POST" })).body.error).toBe("plugin_offline");
+    const ws = openSocket(s.urls.websocketUrl, s.token);
+    await ws.next("hello");
+    try {
+      expect((await s.browser.request(url, { method: "POST" })).body).toEqual({ ok: true, sent: 1 });
+      const first = await ws.next("donation.replay");
+      expect(first.donation).toMatchObject({ id: "RETRY", seq: row.seq.toString(), amount: 1000 });
+      await s.browser.request(url, { method: "POST" });
+      expect((await ws.next("donation.replay")).requestId).not.toBe(first.requestId);
+      const saved = await h.db.donation.findUniqueOrThrow({ where: { id: row.id } });
+      expect(saved.resendCount).toBe(2);
+      expect(saved.lastResentAt).not.toBeNull();
+      expect(saved.accountedAt).toBeNull();
+      expect(await h.db.donation.count({ where: { webhookId: s.id } })).toBe(1);
+      expect((await s.browser.request(`/api/webhooks/${s.id}/donations/recover`, { method: "POST" })).body.sent).toBe(1);
+      expect((await ws.next("donations.recover")).requestId).toBeTypeOf("string");
+    } finally { ws.socket.close(); }
+  });
+
+  it("accepts idempotent flow receipts only for the token's webhook", async () => {
+    const s = await setup(), other = await setup();
+    h.livepix.messages.set("receipt", message("receipt", "RECEIPT"));
+    await importPage(s, 1);
+    const acknowledge = (owner: Setup, token = owner.token, eventKey = "livepix:donation:RECEIPT") => fetch(`${owner.urls.apiUrl}/accounted`, {
+      method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ eventKey }),
+    });
+    expect((await acknowledge(s, other.token)).status).toBe(401);
+    expect((await acknowledge(other)).status).toBe(404);
+    expect((await acknowledge(s, s.token, "wrong")).status).toBe(400);
+    expect((await acknowledge(s)).status).toBe(200);
+    const first = await h.db.donation.findFirstOrThrow({ where: { webhookId: s.id } });
+    expect(first.accountedAt).not.toBeNull();
+    expect((await acknowledge(s)).status).toBe(200);
+    expect((await h.db.donation.findUniqueOrThrow({ where: { id: first.id } })).accountedAt).toEqual(first.accountedAt);
+    const list = await s.browser.request(`/api/webhooks/${s.id}/donations`);
+    expect(list.body.donations[0].accountedAt).toBe(first.accountedAt!.toISOString());
+    await s.browser.request(`/api/webhooks/${s.id}`, { method: "PATCH", body: { active: false } });
+    expect((await acknowledge(s)).status).toBe(403);
+  });
+
+  it("isolates history and resend actions by owner and webhook, including inactive webhooks", async () => {
+    const s = await setup(), other = await setup();
+    h.livepix.messages.set("scoped", message("scoped", "SCOPED"));
+    await importPage(s, 1);
+    const row = await h.db.donation.findFirstOrThrow({ where: { webhookId: s.id } });
+    for (const path of ["import", "recover", `${row.id}/resend`]) {
+      expect((await other.browser.request(`/api/webhooks/${s.id}/donations/${path}`, { method: "POST" })).status).toBe(404);
+    }
+    expect((await other.browser.request(`/api/webhooks/${other.id}/donations/${row.id}/resend`, { method: "POST" })).status).toBe(404);
+    expect((await s.browser.request(`/api/webhooks/${s.id}/donations/recover`, { method: "POST" })).body.error).toBe("plugin_offline");
+    await s.browser.request(`/api/webhooks/${s.id}`, { method: "PATCH", body: { active: false } });
+    for (const path of ["import", "recover", `${row.id}/resend`]) {
+      expect((await s.browser.request(`/api/webhooks/${s.id}/donations/${path}`, { method: "POST" })).body.error).toBe("webhook_inactive");
+    }
+  });
+});
 
 describe("accounts and webhooks", () => {
   it("keeps the dashboard API behind a session", async () => {

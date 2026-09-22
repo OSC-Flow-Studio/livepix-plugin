@@ -1,7 +1,8 @@
 import type { SecretBox } from "./crypto.js";
+import { z } from "zod";
 import type { Db } from "./db.js";
 import { toPluginDonation } from "./dto.js";
-import { LivePixError, type LivePixClient, type LivePixCredentials } from "./livepix/client.js";
+import { LivePixError, type LivePixClient, type LivePixCredentials, type LivePixResource } from "./livepix/client.js";
 import { donationKey, toDonation, type DonationInput } from "./livepix/donation.js";
 import type { RealtimeHub } from "./realtime.js";
 import { Prisma, type Delivery, type Donation, type Webhook } from "../generated/prisma/client.js";
@@ -12,6 +13,7 @@ const BASE_BACKOFF_MS = 30_000;
 const MAX_BACKOFF_MS = 30 * 60_000;
 /** A payment notification looks for its message among the latest ones to read name and text. */
 const MESSAGE_LOOKBACK = 20;
+const providerDate = z.iso.datetime({ offset: true });
 
 export interface Logger {
   info(message: string): void;
@@ -101,7 +103,7 @@ export function createProcessor(options: ProcessorOptions) {
     return payment;
   }
 
-  async function store(webhook: Webhook, input: DonationInput): Promise<Outcome> {
+  async function store(webhook: Webhook, input: DonationInput, publish = true): Promise<Outcome> {
     const existing = await db.donation.findUnique({ where: { webhookId_key: { webhookId: webhook.id, key: input.key } } });
     if (existing) {
       // The second notification for the same donation. It may carry the text the first one lacked;
@@ -133,7 +135,7 @@ export function createProcessor(options: ProcessorOptions) {
           raw: input.raw as Prisma.InputJsonObject,
         },
       });
-      hub.publish(webhook.id, { type: "donation", donation: toPluginDonation(donation) });
+      if (publish) hub.publish(webhook.id, { type: "donation", donation: toPluginDonation(donation) });
       return { status: "processed", donation };
     } catch (error) {
       // Two notifications for one donation processed at the same moment: the other one won.
@@ -240,6 +242,23 @@ export function createProcessor(options: ProcessorOptions) {
   return {
     process,
     drain,
+    /** One bounded page per request. Continue until an empty page, without assuming date order. */
+    async importPage(webhook: Webhook, since: Date, resource: LivePixResource, page: number) {
+      const items = await livepix.list(credentialsOf(webhook), resource, 100, page);
+      let imported = 0, existing = 0, excluded = 0, invalid = 0;
+      for (const item of items) {
+        // Missing provider dates must never turn an old payment into a current donation.
+        const date = providerDate.safeParse(item.createdAt);
+        const at = date.success ? Date.parse(date.data) : NaN;
+        if (!Number.isFinite(at) || !donationKey(item) || !Number.isFinite(Number(item.amount)) || Number(item.amount) < 0) { invalid++; continue; }
+        if (at < since.getTime()) { excluded++; continue; }
+        const input = toDonation(item, resource === "messages" ? "message" : "payment", new Date());
+        const outcome = await store(webhook, input, false);
+        if (outcome.status === "processed") imported++;
+        else existing++;
+      }
+      return { fetched: items.length, imported, existing, excluded, invalid, hasMore: items.length > 0 };
+    },
     /** Retries what failed only for lack of credentials, after the user saved them. */
     async requeueWebhook(webhookId: string): Promise<number> {
       const result = await db.delivery.updateMany({

@@ -191,6 +191,10 @@ model Donation {
   reference  String     @default("")
   source     String
   raw        Json
+  /// Receipt explicitly sent by the flow after downstream accounting succeeded.
+  accountedAt DateTime?
+  lastResentAt DateTime?
+  resendCount Int @default(0)
   deliveries Delivery[]
 
   @@unique([webhookId, key])

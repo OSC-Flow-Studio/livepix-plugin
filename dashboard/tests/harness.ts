@@ -24,6 +24,7 @@ export class FakeLivePix {
   payments = new Map<string, Item>();
   failWith: number | null = null;
   calls: string[] = [];
+  pages: Array<{ resource: string; page: number; limit: number }> = [];
 
   fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const url = new URL(String(input instanceof Request ? input.url : input));
@@ -41,7 +42,10 @@ export class FakeLivePix {
       const item = store.get(decodeURIComponent(id));
       return item ? json({ data: item }) : json({ error: "not found" }, 404);
     }
-    return json({ data: [...store.values()].reverse() });
+    const page = Number(url.searchParams.get("page") || 1);
+    const limit = Number(url.searchParams.get("limit") || 20);
+    this.pages.push({ resource: resource!, page, limit });
+    return json({ data: [...store.values()].reverse().slice((page - 1) * limit, page * limit) });
   };
 }
 

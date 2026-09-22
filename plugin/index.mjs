@@ -7,23 +7,21 @@
  * and reads the dashboard API when the socket is down, after every reconnect
  * and every few minutes as a safety net.
  *
- * Whatever the path, a donation fires at most once: its id is written to the
- * vault before the trigger is emitted, and only donations from the subathon
- * start onwards are considered. A crash, a restart or a long disconnection
- * therefore never loses a donation that the dashboard kept, and never credits
- * one twice.
+ * Both paths share a persistent ID ledger. Re-enabling reconciles from the
+ * selected start without forgetting IDs from previous runs or date selections.
+ * Trigger delivery has no consumer acknowledgment, so downstream accounting
+ * also uses the stable donation key.
  */
 
 import { createHash, randomBytes } from "node:crypto";
 import http from "node:http";
 import https from "node:https";
+import { loadIdLedger } from "./id-ledger.mjs";
 
 const STATE_KEY = "livepix-state-v1";
-const STATE_VERSION = 3;
+const STATE_VERSION = 4;
 const DEFAULT_BASE_URL = "https://livepix.maned.club";
 const PAGE_LIMIT = 500;
-const MAX_PAGES_PER_SYNC = 60;
-const MAX_PROCESSED = 10_000;
 const REQUEST_TIMEOUT_MS = 10_000;
 /** While the socket is up, a full read from the subathon start still runs this often. */
 const RECONCILE_MS = 5 * 60_000;
@@ -62,22 +60,22 @@ function describe(error) {
  * alone (midnight) or a full ISO timestamp. Returns NaN when it cannot.
  */
 export function parseStartAt(raw) {
-  const text = typeof raw === "string" ? raw.trim() : "";
+  const text = (typeof raw === "string" ? raw.trim() : "")
+    .replace(/^(\d{2})\/(\d{2})\/(\d{4})(.*)$/, "$3-$2-$1$4");
   if (!text) return NaN;
-  if (/[zZ]$|[+-]\d{2}:?\d{2}$/.test(text)) return Date.parse(text);
-  let match = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$/.exec(text);
-  let parts = match ? [match[1], match[2], match[3], match[4], match[5], match[6]] : null;
-  if (!parts) {
-    match = /^(\d{2})\/(\d{2})\/(\d{4})(?: (\d{2}):(\d{2})(?::(\d{2}))?)?$/.exec(text);
-    parts = match ? [match[3], match[2], match[1], match[4], match[5], match[6]] : null;
-  }
-  if (!parts) return NaN;
-  const [year, month, day, hour = "0", minute = "0", second = "0"] = parts.map((part) => part ?? undefined);
-  const date = new Date(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second));
-  // new Date() rolls 31/02 over into March; a date that moved was not a real date.
-  if (date.getFullYear() !== Number(year) || date.getMonth() !== Number(month) - 1 || date.getDate() !== Number(day)) {
-    return NaN;
-  }
+  const match = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2})(\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})?)?$/.exec(text);
+  if (!match) return NaN;
+  const [, y, m, d, h = "0", min = "0", sec = "0", fraction = "", zone] = match;
+  const [year, month, day, hour, minute, second] = [y, m, d, h, min, sec].map(Number);
+  if (!year || month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) return NaN;
+  const calendar = new Date(0);
+  calendar.setUTCFullYear(year, month - 1, day);
+  if (calendar.getUTCMonth() !== month - 1 || calendar.getUTCDate() !== day) return NaN;
+  if (zone) return Date.parse(text.replace(" ", "T"));
+  const date = new Date(0);
+  date.setFullYear(year, month - 1, day);
+  date.setHours(hour, minute, second, Number(fraction || 0) * 1000);
+  if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day || date.getHours() !== hour) return NaN;
   return date.getTime();
 }
 
@@ -153,10 +151,9 @@ function hydrateState(raw, log) {
       log.info(String(next.processed.length) + " doação(ões) da versão anterior mantidas como já processadas");
       return next;
     }
-    if (Number(parsed.version) !== STATE_VERSION) {
-      log.warn("estado de uma versão desconhecida; começando do zero a partir do início do subathon");
-      return next;
-    }
+    if (![3, STATE_VERSION].includes(Number(parsed.version))) throw new Error("Unsupported persisted LivePix state version");
+    if (Number(parsed.version) === STATE_VERSION && !parsed.idLedger) throw new Error("Missing persisted LivePix ID ledger");
+    next.idLedger = parsed.idLedger;
     next.processed = Array.isArray(parsed.processed)
       ? parsed.processed.filter((entry) => Array.isArray(entry) && typeof entry[0] === "string" && Number.isFinite(entry[1]))
       : [];
@@ -165,35 +162,22 @@ function hydrateState(raw, log) {
     next.lastSyncAt = typeof parsed.lastSyncAt === "string" ? parsed.lastSyncAt : "";
     return next;
   } catch (error) {
-    log.warn("estado persistido inválido; começando do zero: " + describe(error));
-    return initialState();
+    throw new Error("Cannot restore LivePix state: " + describe(error));
   }
 }
 
 async function persist(runtime) {
-  runtime.state.processed = [...runtime.processed.entries()];
   try {
     await runtime.ctx.secrets.set(STATE_KEY, JSON.stringify(runtime.state));
   } catch (error) {
     runtime.ctx.log.warn("não foi possível persistir o estado: " + describe(error));
+    throw error;
   }
 }
 
 /** The subathon start in effect: the configured one, else the first activation without one. */
 function startAtMs(runtime) {
   return Number.isFinite(runtime.config.startAtMs) ? runtime.config.startAtMs : runtime.state.autoStartAt;
-}
-
-/** Forgets donations before the start (they can never fire) and caps the ledger. */
-function pruneProcessed(runtime) {
-  const start = startAtMs(runtime);
-  for (const [key, at] of runtime.processed) {
-    if (at < start) runtime.processed.delete(key);
-  }
-  if (runtime.processed.size > MAX_PROCESSED) {
-    const oldest = [...runtime.processed.entries()].sort((a, b) => a[1] - b[1]);
-    for (const [key] of oldest.slice(0, runtime.processed.size - MAX_PROCESSED)) runtime.processed.delete(key);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -244,38 +228,58 @@ function seqAbove(a, b) {
  * Takes donations from either path. Each new one is marked as processed and the
  * ledger is written to the vault before any trigger fires.
  */
-function accept(runtime, donations) {
-  const work = acceptNow(runtime, donations);
+function accept(runtime, donations, replay = false, requestId = "") {
+  const work = queueMutation(runtime, () => acceptNow(runtime, donations, replay, requestId));
   runtime.inFlight.add(work);
   return work.finally(() => runtime.inFlight.delete(work));
 }
 
-async function acceptNow(runtime, donations) {
+function queueMutation(runtime, callback) {
+  const work = runtime.queue.then(callback);
+  runtime.queue = work.catch(() => {});
+  return work;
+}
+
+async function acceptNow(runtime, donations, replay, requestId) {
+  if (runtime.stopped) return 0;
+  if (requestId && runtime.replayRequests.has(requestId)) return 0;
   const start = startAtMs(runtime);
   const fresh = [];
+  const addedIds = new Set();
+  const previousSeq = runtime.state.lastSeq;
+  const previousLedger = runtime.state.idLedger;
   for (const donation of donations) {
     if (!donation || typeof donation !== "object" || typeof donation.id !== "string" || !donation.id) continue;
     if (typeof donation.seq === "string" && seqAbove(donation.seq, runtime.state.lastSeq)) {
       runtime.state.lastSeq = donation.seq;
     }
-    if (runtime.processed.has(donation.id)) continue;
+    if ((!replay && runtime.processed.has(donation.id)) || addedIds.has(donation.id)) continue;
     const at = Date.parse(donation.occurredAt);
     if (!Number.isFinite(at) || at < start) continue;
-    runtime.processed.set(donation.id, at);
+    addedIds.add(donation.id);
     const amount = Number(donation.amount);
     const currency = String(donation.currency || "").toUpperCase();
     if (!(amount > 0) || currency !== runtime.config.currency) continue;
     fresh.push({ donation, at });
   }
-  if (fresh.length === 0) return 0;
-  pruneProcessed(runtime);
-  await persist(runtime);
+  if (addedIds.size === 0 && previousSeq === runtime.state.lastSeq) return 0;
+  try {
+    runtime.state.idLedger = await runtime.idLedger.prepare(addedIds);
+    await persist(runtime);
+  } catch (error) {
+    runtime.state.idLedger = previousLedger;
+    runtime.state.lastSeq = previousSeq;
+    throw error;
+  }
   if (runtime.stopped) {
     // Deactivated between the write and the triggers: forget them again, so the final
     // write in deactivate() leaves them unprocessed and the next activation fires them.
-    for (const { donation } of fresh) runtime.processed.delete(donation.id);
+    runtime.state.idLedger = previousLedger;
+    runtime.state.lastSeq = previousSeq;
     return 0;
   }
+  runtime.idLedger.commit(runtime.state.idLedger, addedIds);
+  if (requestId) rememberReplay(runtime, requestId);
   fresh.sort((a, b) => a.at - b.at);
   for (const { donation } of fresh) {
     runtime.ctx.emitTrigger("donation", buildPayload(donation));
@@ -343,27 +347,31 @@ function sync(runtime, reason, full) {
   return runtime.syncPromise;
 }
 
-async function runSync(runtime, reason, full) {
+async function runSync(runtime, reason, full, replay = false) {
   let fetched = 0;
   let emitted = 0;
   try {
     const since = new Date(startAtMs(runtime)).toISOString();
     let after = full ? "0" : runtime.state.lastSeq;
-    for (let page = 0; page < MAX_PAGES_PER_SYNC; page += 1) {
+    while (!runtime.stopped) {
       const result = await fetchPage(runtime, since, after);
       fetched += result.donations.length;
-      emitted += await accept(runtime, result.donations);
-      if (!result.hasMore || !result.nextAfter || result.nextAfter === after) break;
+      emitted += await accept(runtime, result.donations, replay);
+      if (!result.hasMore) break;
+      if (!seqAbove(result.nextAfter, after)) throw new Error("Dashboard pagination did not advance");
       after = result.nextAfter;
     }
-    runtime.state.lastSyncAt = new Date().toISOString();
+    runtime.controller.signal.throwIfAborted();
+    await queueMutation(runtime, async () => {
+      runtime.state.lastSyncAt = new Date().toISOString();
+      await persist(runtime);
+    });
     if (full) runtime.lastFullSyncAt = Date.now();
     runtime.apiError = "";
     runtime.lastSyncOk = true;
-    await persist(runtime);
     if (emitted > 0) runtime.ctx.log.info(String(emitted) + " gatilho(s) disparado(s) pela API (" + reason + ")");
     publishStatus(runtime);
-    return { ok: true, fetched, emitted };
+    return { ok: true, fetched, emitted, error: "" };
   } catch (error) {
     if (runtime.stopped) return { ok: false, fetched, emitted, error: "consulta cancelada" };
     runtime.apiError = describe(error);
@@ -372,6 +380,44 @@ async function runSync(runtime, reason, full) {
     publishStatus(runtime);
     return { ok: false, fetched, emitted, error: runtime.apiError };
   }
+}
+
+function rememberReplay(runtime, requestId) {
+  runtime.replayRequests.add(requestId);
+  if (runtime.replayRequests.size > 1000) runtime.replayRequests.delete(runtime.replayRequests.values().next().value);
+}
+
+/** Explicit recovery retries delivery. The downstream ledger decides whether it was accounted. */
+function recover(runtime) {
+  const problem = configProblem(runtime.config);
+  if (runtime.stopped || !runtime.config.enabled || problem) {
+    return Promise.resolve({ ok: false, fetched: 0, emitted: 0, error: problem || "plugin desativado" });
+  }
+  if (!runtime.recoveryPromise) {
+    runtime.recoveryPromise = (async () => {
+      await runtime.syncPromise;
+      return runSync(runtime, "recuperação manual", true, true);
+    })().finally(() => { runtime.recoveryPromise = null; });
+  }
+  return runtime.recoveryPromise;
+}
+
+async function confirmAccounted(runtime, data) {
+  const eventKey = asText(data.eventKey, "");
+  const problem = configProblem(runtime.config);
+  if (problem || runtime.stopped || !runtime.config.enabled) return { ok: false, error: problem || "plugin desativado" };
+  if (data.accounted !== true) return { ok: false, error: "A contabilização não foi confirmada pelo bloco anterior." };
+  if (!eventKey.startsWith("livepix:donation:") || eventKey.length <= "livepix:donation:".length) return { ok: false, error: "Chave de doação inválida." };
+  try {
+    const response = await fetch(runtime.config.baseUrl + "/" + runtime.config.webhookId + "/api/accounted", {
+      method: "POST", headers: { ...authHeaders(runtime), "content-type": "application/json" }, body: JSON.stringify({ eventKey }),
+      signal: AbortSignal.any([runtime.controller.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
+    });
+    if (!response.ok) throw new Error("OSC LivePix Dashboard respondeu HTTP " + response.status);
+    const result = await response.json();
+    if (result?.ok !== true) throw new Error("Invalid accounting receipt response");
+    return { ok: true, error: "" };
+  } catch (error) { return { ok: false, error: describe(error) }; }
 }
 
 function scheduleSync(runtime, delayMs) {
@@ -461,6 +507,7 @@ export function connectWebSocket(target, headers, { onOpen, onMessage, onClose }
     finish(status === 401 ? 4001 : status === 403 ? 4003 : 1006, "HTTP " + String(status));
   });
   request.on("upgrade", (response, upgraded, head) => {
+    if (closed) { upgraded.destroy(); return; }
     socket = upgraded;
     const expected = createHash("sha1").update(key + WS_GUID).digest("base64");
     if (response.headers["sec-websocket-accept"] !== expected) {
@@ -565,6 +612,7 @@ function openSocket(runtime) {
   if (runtime.stopped || runtime.socket) return;
   runtime.socket = connectWebSocket(websocketUrl(runtime), { authorization: "Bearer " + runtime.config.apiToken }, {
     onOpen() {
+      if (runtime.stopped) return;
       runtime.socketOpen = true;
       runtime.reconnectMs = 0;
       runtime.socketError = "";
@@ -574,6 +622,7 @@ function openSocket(runtime) {
       void sync(runtime, "reconexão", true).finally(() => scheduleSync(runtime));
     },
     onMessage(text) {
+      if (runtime.stopped) return;
       armSilenceTimer(runtime);
       let message;
       try {
@@ -581,10 +630,25 @@ function openSocket(runtime) {
       } catch {
         return;
       }
-      if (message && message.type === "donation" && message.donation) {
-        void accept(runtime, [message.donation]).then((emitted) => {
+      if (message?.type === "donations.recover" && typeof message.requestId === "string" && message.requestId) {
+        if (runtime.replayRequests.has(message.requestId)) return;
+        rememberReplay(runtime, message.requestId);
+        void recover(runtime);
+      }
+      if (message && ["donation", "donation.replay"].includes(message.type) && message.donation) {
+        const replay = message.type === "donation.replay";
+        if (replay && (typeof message.requestId !== "string" || !message.requestId)) return;
+        void accept(runtime, [message.donation], replay, replay ? message.requestId : "").then((emitted) => {
           if (emitted > 0) runtime.ctx.log.info("doação recebida em tempo real");
           publishStatus(runtime);
+        }).catch((error) => {
+          if (runtime.stopped) return;
+          runtime.apiError = describe(error);
+          runtime.lastSyncOk = false;
+          runtime.lastFullSyncAt = 0;
+          runtime.ctx.log.warn("Donation could not be saved: " + runtime.apiError);
+          publishStatus(runtime);
+          scheduleSync(runtime, runtime.config.pollSeconds * 1000);
         });
       }
     },
@@ -649,6 +713,11 @@ function publishStatus(runtime) {
     return;
   }
   const mode = transport(runtime);
+  if (runtime.apiError) {
+    runtime.ctx.setStatus({ health: "degraded", connectionState: "com erro",
+      errors: [runtime.apiError, runtime.socketError && "WebSocket: " + runtime.socketError].filter(Boolean) });
+    return;
+  }
   if (mode === "websocket") {
     runtime.ctx.setStatus({ health: "healthy", connectionState: "tempo real (WebSocket)" });
     return;
@@ -702,18 +771,17 @@ export default {
   async activate(ctx) {
     if (activeRuntime) throw new Error("LivePix já está ativo");
     const config = normalizeConfig(await ctx.config.get());
-    let persisted = null;
-    try {
-      persisted = await ctx.secrets.get(STATE_KEY);
-    } catch {
-      persisted = null;
-    }
+    const persisted = await ctx.secrets.get(STATE_KEY);
     const state = hydrateState(persisted, ctx.log);
+    const idLedger = await loadIdLedger(ctx.secrets, "livepix-ids", state.idLedger, state.processed.map(([id]) => id));
+    state.idLedger = idLedger.descriptor;
+    delete state.processed;
     const runtime = {
       ctx,
       config,
       state,
-      processed: new Map(state.processed),
+      idLedger,
+      processed: idLedger.ids,
       controller: new AbortController(),
       stopped: false,
       socket: null,
@@ -722,9 +790,12 @@ export default {
       apiError: "",
       lastSyncOk: false,
       syncPromise: null,
+      recoveryPromise: null,
+      replayRequests: new Set(),
       fullSyncQueued: false,
       lastFullSyncAt: 0,
       inFlight: new Set(),
+      queue: Promise.resolve(),
       syncTimer: null,
       reconnectTimer: null,
       silenceTimer: null,
@@ -742,6 +813,8 @@ export default {
       return sync(runtime, "ação", true);
     });
     ctx.registerAction("status", async () => statusSnapshot(runtime));
+    ctx.registerAction("recover", async () => recover(runtime));
+    ctx.registerAction("confirm-accounted", async (data) => confirmAccounted(runtime, data));
 
     if (runtime.stopped) return;
     if (!config.enabled) {
@@ -759,8 +832,14 @@ export default {
       state.autoStartAt = Date.now();
       ctx.log.info("sem início do subathon configurado; contando doações a partir de agora");
     }
-    pruneProcessed(runtime);
-    await persist(runtime);
+    try {
+      await persist(runtime);
+    } catch (error) {
+      stopRuntime(runtime);
+      ctx.signal?.removeEventListener("abort", runtime.onAbort);
+      activeRuntime = null;
+      throw error;
+    }
     publishStatus(runtime);
     openSocket(runtime);
     void sync(runtime, "ativação", true).finally(() => scheduleSync(runtime));
@@ -771,9 +850,14 @@ export default {
     if (!runtime) return;
     stopRuntime(runtime);
     runtime.ctx.signal?.removeEventListener("abort", runtime.onAbort);
-    await runtime.syncPromise;
-    await Promise.allSettled([...runtime.inFlight]);
-    await persist(runtime);
-    activeRuntime = null;
+    try {
+      await runtime.syncPromise;
+      await runtime.recoveryPromise;
+      await Promise.allSettled([...runtime.inFlight]);
+      await runtime.queue;
+      await persist(runtime);
+    } finally {
+      activeRuntime = null;
+    }
   },
 };

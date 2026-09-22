@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.0.1 (2026-09-22)
+
+- Recover missing webhook donations from paginated LivePix payment/message history,
+  preserving saved rows across failures and validating provider dates.
+- Add dashboard search, individual WebSocket resend, and Subathon history recovery.
+  Replays retain the original accounting key and respect the plugin's start date.
+- Add an explicit post-accounting receipt action and distinguish confirmed accounting
+  from delivery attempts in the dashboard. Include an additive database migration.
+
+- Use Studio's native date and time field for the subathon start, retaining legacy
+  date formats and offsets. Fix the malformed start-date and base-URL patterns.
+- Reconcile all pages after activation or reconnection without expiring processed
+  IDs. Migrate existing IDs into bounded encrypted pages shared by both transports.
+- Serialize state changes and stop emission when persistence fails. Preserve IDs for
+  retry and report unreadable state instead of starting a new ledger.
+- Validate donation, sync, and status outputs through the Studio engine and the
+  bundled CatOPanda flow, including replay after restart.
+
 ## 2.0.0 (2026-09-21)
 
 - As doações chegam pelo OSC LivePix Dashboard, que recebe o webhook do LivePix e guarda

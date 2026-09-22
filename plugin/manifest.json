@@ -5,7 +5,7 @@
   "version": "2.0.0",
   "packageId": "io.github.osc-flow-studio.livepix",
   "engines": {
-    "oscFlowStudio": ">=0.5.0 <0.6.0"
+    "oscFlowStudio": ">=0.5.4 <0.6.0"
   },
   "author": {
     "name": "OSC Flow Studio",
@@ -81,7 +81,7 @@
         "label": "URL base da API",
         "description": "Endereço do OSC LivePix Dashboard. Mude só se você hospeda o seu próprio.",
         "default": "https://livepix.maned.club",
-        "pattern": "^https?://[^s/]+(/[^s]*)?$",
+        "pattern": "^https?://[^\\s/]+(/[^\\s]*)?$",
         "tab": "connection"
       },
       {
@@ -93,11 +93,10 @@
       },
       {
         "key": "startAt",
-        "type": "string",
+        "type": "datetime",
         "label": "Início do subathon",
-        "description": "Data e hora locais no formato AAAA-MM-DD HH:mm ou DD/MM/AAAA HH:mm. Só doações a partir deste momento disparam. Vazio conta a partir da primeira ativação.",
+        "description": "Horário local. Ao ativar, busca as doações desde esse momento sem repetir os IDs já processados. Vazio conta a partir da primeira ativação.",
         "default": "",
-        "pattern": "^$|^d{4}-d{2}-d{2}([ T]d{2}:d{2}(:d{2})?)?$|^d{2}/d{2}/d{4}( d{2}:d{2}(:d{2})?)?$",
         "tab": "subathon"
       }
     ]
@@ -107,7 +106,7 @@
       "type": "trigger.x.livepix.donation",
       "label": "LivePix: doação recebida",
       "category": "LivePix",
-      "description": "Dispara uma vez por doação nova a partir do início do subathon, com valor em centavos e, quando houver, nome e mensagem do apoiador.",
+      "description": "Recebe doações desde o início do subathon e reenvios solicitados no dashboard. Reenvios mantêm a mesma chave única para o Subathon evitar contagem duplicada.",
       "role": "trigger",
       "matchFields": [
         {
@@ -278,6 +277,38 @@
       ]
     },
     {
+      "type": "action.x.livepix.recover",
+      "label": "LivePix: recuperar doações",
+      "category": "LivePix",
+      "description": "Reenvia o histórico salvo no dashboard desde o início do subathon, inclusive doações cujo fluxo falhou. Use a chave única no Registrar Donate para não contar duas vezes. Execute manualmente após corrigir o fluxo.",
+      "role": "action",
+      "outputSchema": [
+        { "path": "ok", "type": "boolean", "description": "Indica que a leitura e o reenvio terminaram. Não confirma contabilização." },
+        { "path": "fetched", "type": "number", "description": "Doações lidas do dashboard." },
+        { "path": "emitted", "type": "number", "description": "Gatilhos reenviados." },
+        { "path": "error", "type": "string", "description": "Erro de leitura ou reenvio, se houver." }
+      ]
+    },
+    {
+      "type": "action.x.livepix.confirm-accounted",
+      "label": "LivePix: confirmar contabilização",
+      "category": "LivePix",
+      "description": "Confirma ao dashboard que Registrar Donate aceitou a doação ou reconheceu sua chave como já contabilizada. Conecte depois desse bloco.",
+      "role": "action",
+      "fields": [
+        { "key": "eventKey", "label": "Chave da doação", "kind": "text", "helpText": "Use $trigger.metadata.eventKey, sem alterar a chave." },
+        { "key": "accounted", "label": "Contabilização confirmada", "kind": "boolean", "helpText": "Use a fórmula $json.accepted || $json.duplicate do Registrar Donate." }
+      ],
+      "defaultData": {
+        "eventKey": { "mode": "expression", "expression": "{{ $trigger.metadata.eventKey }}" },
+        "accounted": { "mode": "expression", "expression": "{{ $json.accepted || $json.duplicate }}" }
+      },
+      "outputSchema": [
+        { "path": "ok", "type": "boolean", "description": "Confirmação gravada no dashboard." },
+        { "path": "error", "type": "string", "description": "Erro ao gravar a confirmação, se houver." }
+      ]
+    },
+    {
       "type": "action.x.livepix.status",
       "label": "LivePix: ler status",
       "category": "LivePix",
@@ -307,7 +338,7 @@
         {
           "path": "seen",
           "type": "number",
-          "description": "Doações já processadas desde o início do subathon."
+          "description": "IDs guardados pelo plugin, inclusive de ativações anteriores. Não confirma contabilização no subathon."
         },
         {
           "path": "emittedSinceStart",

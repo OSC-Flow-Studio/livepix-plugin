@@ -1,5 +1,9 @@
 # LivePix para OSC Flow Studio
 
+For donation history recovery, individual resend, and accounting confirmation, see
+[Recovering donations](plugin/README.md#recovering-donations). Update the dashboard and
+plugin together and add the receipt block to existing Subathon flows.
+
 Cada doação do LivePix dispara um flow no OSC Flow Studio **0.5.x**. Este repositório tem
 duas partes:
 
@@ -13,7 +17,7 @@ duas partes:
 | Contrato | Valor |
 | --- | --- |
 | Versão do plugin | 2.0.0 |
-| OSC Flow Studio | `>=0.5.0 <0.6.0` |
+| OSC Flow Studio | `>=0.5.4 <0.6.0` (build with native date fields) |
 | Identidade pública | `io.github.osc-flow-studio.livepix` |
 | ID dos blocos e configurações | `livepix` |
 | Runtime SDK | API 1 |
@@ -61,7 +65,7 @@ instalar este pacote; conclua o reinício solicitado.
 
 Requisito: Node.js 22 ou superior e npm. O Node.js é necessário para desenvolvimento;
 o Studio executa o plugin usando seu próprio runtime. O repositório contém o schema
-e o empacotador oficiais do SDK 0.5.0 em `sdk/` e não depende de pastas irmãs.
+e o empacotador oficiais do SDK 0.5.4 em `sdk/` e não depende de pastas irmãs.
 
 ```powershell
 cd J:\Projetos\Portfolio\livepix-plugin

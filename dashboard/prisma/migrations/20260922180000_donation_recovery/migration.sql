@@ -1,0 +1,3 @@
+ALTER TABLE "donation" ADD COLUMN "accountedAt" TIMESTAMP(3),
+  ADD COLUMN "lastResentAt" TIMESTAMP(3),
+  ADD COLUMN "resendCount" INTEGER NOT NULL DEFAULT 0;

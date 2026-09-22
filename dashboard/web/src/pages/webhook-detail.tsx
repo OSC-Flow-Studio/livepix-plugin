@@ -95,7 +95,7 @@ export function WebhookDetailPage() {
   const baseUrl = data.apiUrl.slice(0, data.apiUrl.length - `/${data.id}/api`.length);
 
   return (
-    <div className="grid gap-6">
+    <div className="grid min-w-0 grid-cols-1 gap-6">
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div className="flex min-w-0 items-center gap-3">
           <Button variant="outline" size="icon" asChild aria-label="Voltar para a lista">
@@ -122,7 +122,7 @@ export function WebhookDetailPage() {
         </div>
       </div>
 
-      <div className="grid gap-6 lg:grid-cols-2">
+      <div className="grid min-w-0 grid-cols-1 gap-6 lg:grid-cols-2">
         <Card>
           <CardHeader>
             <CardTitle>URL para o LivePix</CardTitle>
@@ -287,8 +287,8 @@ function PluginCard({ webhook, baseUrl, onChange }: { webhook: WebhookView; base
           conexão cai.
         </CardDescription>
       </CardHeader>
-      <CardContent className="grid gap-4">
-        <div className="grid gap-2">
+      <CardContent className="grid min-w-0 grid-cols-1 gap-4">
+        <div className="grid min-w-0 grid-cols-1 gap-2">
           <Label htmlFor="base-url">URL base da API</Label>
           <CopyField id="base-url" value={baseUrl} />
         </div>

@@ -24,7 +24,7 @@ export interface LivePixClientOptions {
 
 export interface LivePixClient {
   get(credentials: LivePixCredentials, resource: LivePixResource, id: string): Promise<Record<string, unknown>>;
-  list(credentials: LivePixCredentials, resource: LivePixResource, limit: number): Promise<Record<string, unknown>[]>;
+  list(credentials: LivePixCredentials, resource: LivePixResource, limit: number, page?: number): Promise<Record<string, unknown>[]>;
 }
 
 const SCOPE = "payments:read messages:read";
@@ -100,12 +100,15 @@ export function createLivePixClient(options: LivePixClientOptions): LivePixClien
       }
       return data as Record<string, unknown>;
     },
-    async list(credentials, resource, limit) {
+    async list(credentials, resource, limit, page = 1) {
       const url = new URL(resource, options.apiBase);
-      url.searchParams.set("page", "1");
+      url.searchParams.set("page", String(page));
       url.searchParams.set("limit", String(limit));
       const data = await authorized(credentials, url);
-      return Array.isArray(data) ? data.filter((item) => item && typeof item === "object") : [];
+      if (!Array.isArray(data) || data.some((item) => !item || typeof item !== "object" || Array.isArray(item))) {
+        throw new LivePixError("Invalid LivePix history response", true);
+      }
+      return data;
     },
   };
 }

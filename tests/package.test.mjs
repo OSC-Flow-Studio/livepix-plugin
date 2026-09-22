@@ -21,7 +21,7 @@ test("standalone SDK builds reproducible installable ZIPs with matching catalog 
     assert.equal(manifest.id, "livepix");
     const workspace = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
     assert.equal(manifest.version, workspace.version);
-    assert.equal(manifest.engines.oscFlowStudio, ">=0.5.0 <0.6.0");
+    assert.equal(manifest.engines.oscFlowStudio, ">=0.5.4 <0.6.0");
     const listing = buildCatalog({ zipPath: first.path });
     assert.equal(listing.url, catalogUrl);
     const entry = listing.packages[manifest.packageId].versions[manifest.version];

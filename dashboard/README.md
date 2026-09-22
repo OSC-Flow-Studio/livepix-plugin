@@ -1,5 +1,8 @@
 # OSC LivePix Dashboard
 
+Donation recovery, accounting receipts, and deployment instructions are documented in
+[Donation recovery](docs/donation-recovery.md).
+
 Recebe o webhook do LivePix, lê cada doação na API do LivePix, guarda tudo no Postgres e
 entrega ao plugin LivePix do OSC Flow Studio por WebSocket e por API. Produção:
 `https://livepix.maned.club`.

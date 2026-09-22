@@ -14,10 +14,10 @@ const validate = ajv.compile(schema);
 const issues = validatePluginDir(fileURLToPath(new URL("../plugin", import.meta.url)));
 if (!validate(manifest)) issues.push(ajv.errorsText(validate.errors, { separator: "\n" }));
 if (manifest.version !== pkg.version) issues.push("package.json e manifest.json precisam ter a mesma versão");
-if (manifest.engines.oscFlowStudio !== ">=0.5.0 <0.6.0") issues.push("Faixa de compatibilidade diferente do SDK validado (0.5.x)");
+if (manifest.engines.oscFlowStudio !== ">=0.5.4 <0.6.0") issues.push("Compatibility range must require the Studio date-field contract (0.5.4)");
 if (issues.length) {
   console.error(issues.join("\n"));
   process.exitCode = 1;
 } else {
-  console.log(`${manifest.id} ${manifest.version}: schema e regras de pacote do SDK 0.5.0 válidos`);
+  console.log(`${manifest.id} ${manifest.version}: SDK 0.5.4 schema and package rules passed`);
 }

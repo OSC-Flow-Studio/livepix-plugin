@@ -1,8 +1,8 @@
-# SDK incorporado
+# Bundled SDK
 
-`ofs-package.mjs` e `community-plugin-manifest.schema.json` são cópias sem alterações
-do SDK exportado pelo OSC Flow Studio **0.5.0**. Servem para validar, empacotar e
-gerar o catálogo; não são incluídos no ZIP instalado.
+`ofs-package.mjs` and `community-plugin-manifest.schema.json` are unmodified copies
+from the OSC Flow Studio **0.5.4** source SDK, including native date fields. They
+validate and package the plugin and are excluded from its installed ZIP.
 
-Ao atualizar o SDK, substitua os dois arquivos juntos, revise o contrato de runtime,
-ajuste a faixa `engines.oscFlowStudio` e execute `npm run package`.
+When updating the SDK, replace both files, review the runtime contract, update
+`engines.oscFlowStudio`, and run `npm run check`.
